@@ -4,13 +4,18 @@
 //   [0]                 gate|up trellis  uint32 [H/16][2I/16][W]   (per k-row: I/16 gate tiles, then I/16 up tiles)
 //   [+GU]               down trellis     uint32 [I/16][H/16][W]
 //   then fp16 vectors   suh_g[H] suh_u[H] svh_g[I] svh_u[I] suh_d[I] svh_d[H]
-// For Qwen3.8-Flash-Next (H=2560, I=640, K=3) a blob is 1,862,400 B.
+// For Qwen3.8-Flash-Next (H=2560, I=640, K=3) a blob is 1,862,400 B; for Ornith-1.5-122B (H=3072, I=1024, K=4)
+// 4,743,168 B (I=256, a TP4 slice: 1,199,616 B).
+// K=4 (D = 1): the words are stored in checkpoint order (the int16 trellis viewed as uint32), like the dense kernels.
 // PLANAR4 word order (default; required by these kernels when D = K/gcd(K,32) > 1): within every k-row the tiles
 // are grouped by 4 along n, and each group's 4*W words are stored plane-major: word (tile t, period g, plane i) at
 // [i][t][g] instead of [t][D*g + i] (g < 8 periods per tile for K=3). This is exactly GemvKernel's register
 // planarization, done once at pack time (removes ~2 x 96 per-element stride-3 moves per tile-row).
 // ptrs[e] (int64) is the blob address of expert e: a device slot (cache arena), or USM host memory
 // (sycl::malloc_host / pinned torch tensor) which the kernels read zero-copy over PCIe. Nothing else changes.
+//
+// Expert ids: local ids in [0, n_experts), or -1 = no expert (vLLM padding rows, or an expert owned by another rank
+// under expert parallelism). A -1 pair contributes nothing; a row whose pairs are all -1 gives exact zeros.
 //
 // Per MoE layer:
 //   align    : one work-group; histogram of topk ids -> active-expert list, pairs sorted by expert, inverse map
@@ -19,7 +24,8 @@
 //   down     : WG per (active expert, 128-col block of H): trellis GEMV, SLM reduce, output Hadamard * svh * w
 //              -> y[pair, H] fp32
 //   combine  : out[m] = sum_k y[pair_of[m, k]]  (fixed order: deterministic)
-// Prefill (many rows per expert): same pipeline with DPAS (XMX) GEMMs over MB-row blocks (moe_*_dpas below).
+// Prefill (many rows per expert, K=3 only): same pipeline with DPAS (XMX) GEMMs over MB-row blocks (moe_*_dpas below).
+// K=4 runs the GEMV kernels at every M. Split choice: moe_plan (host op, below).
 
 #include <torch/all.h>
 #include <torch/library.h>
@@ -144,6 +150,7 @@ struct GateUpKernel {
         if (a >= rt.nact()) return;
         int e, s0, cnt;
         rt.get(a, e, s0, cnt);
+        if (e < 0) return;              // pair mode: -1 id (padding / remote expert); uniform per work-group
         const uint8_t* base = reinterpret_cast<const uint8_t*>(ptrs[e]);
         const uint32_t* tr = reinterpret_cast<const uint32_t*>(base);
         int proj = t & 1, strip = (t >> 1) & 1, p = t >> 2;
@@ -261,7 +268,8 @@ struct GateUpKernel {
 
 // ------------------------------------------------------------------------------------------------
 // down: T = 2 * P (2 strips of NT=4 tiles x P k-splits); WG per (active expert, 128-col block of H).
-template <int K, int MR, int P>
+// RB = tile-rows per batched step; the split needs ((I/16)/P) % RB == 0 (moe_plan picks RB = min((I/16)/P, 8)).
+template <int K, int MR, int P, int RB>
 struct DownKernel {
     const fp16* abuf;
     const int64_t* ptrs;
@@ -276,7 +284,6 @@ struct DownKernel {
     static constexpr int ACC = GK::ACC, NP = GK::NP, GV = GK::GV, G = GK::G, TP = GK::TP;
     static constexpr int L = 32 / Geo<K>::V;
     static constexpr int SLM = P * MR * 128 * 4;
-    static constexpr int RB = (40 / P) < 8 ? (40 / P) : 8;   // tile-rows per batched load (I/16 = 40 for I=640)
 
     void operator()(sycl::nd_item<1> it) const SYCL_ESIMD_KERNEL {
         slm_init<SLM>();
@@ -287,6 +294,7 @@ struct DownKernel {
         if (a >= rt.nact()) return;
         int e, s0, cnt;
         rt.get(a, e, s0, cnt);
+        if (e < 0) return;              // pair mode: -1 id (padding / remote expert); uniform per work-group
         const uint8_t* base = reinterpret_cast<const uint8_t*>(ptrs[e]);
         const uint32_t* tr = reinterpret_cast<const uint32_t*>(base + off_d);
         int strip = t & 1, p = t >> 1;
@@ -367,12 +375,14 @@ struct DownKernel {
     }
 };
 
-// out[m, nb*128 : +128] = sum_k y[pair_of[m*topk + k], ...]
+// out[m, nb*128 : +128] = sum_k y[pair_of[m*topk + k], ...], skipping -1 pairs: pair_of < 0 (grouped mode, set by
+// align) or pair_ids < 0 (pair mode: pair_of == nullptr, pair_ids = topk ids). All pairs -1 -> exact zeros.
 template <typename TOut, typename TY = float>
 struct CombineKernel {
     const TY* y; const int* pair_of; TOut* out;
     int M, H, topk, out_stride;
     int64_t* commit_ptrs = nullptr; int64_t* commit_fill = nullptr; const int* fill_list = nullptr;
+    const int* pair_ids = nullptr;
     void operator()(sycl::nd_item<1> it) const SYCL_ESIMD_KERNEL {
         int id = it.get_global_id(0);
         if (id == 0 && fill_list) {
@@ -388,8 +398,12 @@ struct CombineKernel {
         int m = id / nbn, nb = id % nbn;
         if (m >= M) return;
         simd<float, 128> v = 0.0f;
-        for (int k = 0; k < topk; ++k)
-            v += convert<float>(block_load<TY, 128>(y + (size_t)(pair_of ? pair_of[m * topk + k] : m * topk + k) * H + nb * 128));
+        for (int k = 0; k < topk; ++k) {
+            int i = m * topk + k;
+            int r = pair_of ? pair_of[i] : i;
+            if (r < 0 || (pair_ids && pair_ids[i] < 0)) continue;
+            v += convert<float>(block_load<TY, 128>(y + (size_t)r * H + nb * 128));
+        }
         block_store<TOut, 128>(out + (size_t)m * out_stride + nb * 128, convert<TOut>(v));
     }
 };
@@ -648,8 +662,10 @@ static void launch_align(sycl::queue& q, const int* ids, const float* w, int npa
             for (int e = l; e < E; e += WG) { cnt[e] = 0; fill[e] = 0; }
             sycl::group_barrier(g);
             for (int i = l; i < npairs; i += WG) {
-                sycl::atomic_ref<int, sycl::memory_order::relaxed, sycl::memory_scope::work_group,
-                                 sycl::access::address_space::local_space>(cnt[ids[i]]).fetch_add(1);
+                int e = ids[i];
+                if (e >= 0)             // -1: padding / remote expert, not counted
+                    sycl::atomic_ref<int, sycl::memory_order::relaxed, sycl::memory_scope::work_group,
+                                     sycl::access::address_space::local_space>(cnt[e]).fetch_add(1);
             }
             sycl::group_barrier(g);
             // E <= WG: one expert per work-item
@@ -671,6 +687,7 @@ static void launch_align(sycl::queue& q, const int* ids, const float* w, int npa
             sycl::group_barrier(g);
             for (int i = l; i < npairs; i += WG) {
                 int e = ids[i];
+                if (e < 0) { pair_of[i] = -1; continue; }   // combine skips it
                 int pos = start[e] + sycl::atomic_ref<int, sycl::memory_order::relaxed, sycl::memory_scope::work_group,
                                                       sycl::access::address_space::local_space>(fill[e]).fetch_add(1);
                 pair_tok[pos] = i / topk; pair_w[pos] = w[i]; pair_of[i] = pos;
@@ -679,58 +696,240 @@ static void launch_align(sycl::queue& q, const int* ids, const float* w, int npa
     });
 }
 
-// B70 (planar4 + pair mode), us/layer device M=1 / M=4: gu,dn 10,5 66.0/205.5; 5,5 63.0/196.6; 5,10 60.6/200.3;
-// 10,10 66.1/209.1; 10,20 72.5/241.5 -> gu 5, dn 10 for M = 1 else 5 (g_dn_p = 0: auto)
-static int g_gu_p = 5, g_dn_p = 0;
-void moe_set_splits(int64_t gu_p, int64_t dn_p) { g_gu_p = (int)gu_p; g_dn_p = (int)dn_p; }
+// ------------------------------------------------------------------------------------------------
+// GEMV variants. One X-macro list per K names every compiled kernel; the dispatchers below instantiate only these
+// (inside `if constexpr (K == ...)`), so no unlisted (K, MR, P) gets built. gate|up = (K, MR, P), T = 4 P threads per
+// work-group; down = (K, MR, P, RB), T = 2 P. ESIMD: one work-item is one hardware thread, so T is bounded by the
+// threads of one Xe-core (expected 64 at 128 GRF and 32 at grf_size<256>; moe_info(device) reports each kernel's
+// limit and moe_plan then refuses variants above it).
+//
+// K=3, Qwen3.8-Flash-Next (H=2560, I=640): the set this file always had; down RB = min(40/P, 8), the value RB had
+// before it became a template argument. B70 (planar4 + pair mode), us/layer device M=1 / M=4: gu,dn 10,5
+// 66.0/205.5; 5,5 63.0/196.6; 5,10 60.6/200.3; 10,10 66.1/209.1; 10,20 72.5/241.5 -> gu 5, dn 10 for M = 1 else 5.
+#define MOE_GU_K3(X) X(3, 1, 10) X(3, 2, 10) X(3, 4, 10) X(3, 8, 5) X(3, 1, 5) X(3, 2, 5) X(3, 4, 5) X(3, 1, 20) X(3, 2, 20)
+#define MOE_DN_K3(X) X(3, 1, 5, 8) X(3, 2, 5, 8) X(3, 4, 5, 8) X(3, 8, 5, 8) X(3, 1, 10, 4) X(3, 2, 10, 4) \
+                     X(3, 4, 10, 4) X(3, 1, 20, 2) X(3, 2, 20, 2) X(3, 1, 40, 1)
+// K=4, Ornith-1.5 routed experts (H=3072; I = 1024 whole expert / EP, 512 MoE-TP2, 256 MoE-TP4). gate|up needs
+// (H/16)/P tile-rows per split to be a multiple of 8 (one 128-wide input Hadamard block per 8): P in {4,6,8,12} at
+// H=3072. The 9 down (P, RB) pairs cover I/16 = 64, 32, 16 at P in {2,4,8,16}. MR=4 holds ACC = 1024 fp32 + 1024
+// fp16 (~136 GRF live before temporaries), so it runs at grf_size<256>, which caps T at 32. No K=4 MR=8.
+#define MOE_GU_K4(X) X(4, 1, 4) X(4, 1, 6) X(4, 1, 8) X(4, 1, 12) X(4, 2, 4) X(4, 2, 6) X(4, 2, 8) X(4, 2, 12) \
+                     X(4, 4, 4) X(4, 4, 6) X(4, 4, 8)
+#define MOE_DN_K4_MR(X, MR) X(4, MR, 2, 8) X(4, MR, 4, 8) X(4, MR, 8, 8) X(4, MR, 16, 4) X(4, MR, 4, 4) \
+                            X(4, MR, 8, 4) X(4, MR, 8, 2) X(4, MR, 16, 2) X(4, MR, 16, 1)
+#define MOE_DN_K4(X) MOE_DN_K4_MR(X, 1) MOE_DN_K4_MR(X, 2) MOE_DN_K4_MR(X, 4)
+
+constexpr bool moe_grf256(int K, int MR) { return K == 4 && MR >= 4; }
+
+struct MoeVariant { int kind, K, MR, P, RB; };   // kind 0 = gate|up (RB 0), 1 = down
+static const MoeVariant kMoeVariants[] = {
+#define GUV(K_, MR_, P_) {0, K_, MR_, P_, 0},
+#define DNV(K_, MR_, P_, RB_) {1, K_, MR_, P_, RB_},
+    MOE_GU_K3(GUV) MOE_DN_K3(DNV) MOE_GU_K4(GUV) MOE_DN_K4(DNV)
+#undef GUV
+#undef DNV
+};
+constexpr int kNumMoeVariants = (int)(sizeof(kMoeVariants) / sizeof(kMoeVariants[0]));
+// work-group limit per variant as reported by a device (moe_info(device)); -1 = not queried. gate|up keeps the
+// smaller of its fp16 / bf16 kernels.
+static std::vector<int64_t> g_moe_wg_limit(kNumMoeVariants, -1);
+
+static int moe_variant(int kind, int K, int MR, int P, int RB) {
+    for (int i = 0; i < kNumMoeVariants; ++i) {
+        const MoeVariant& v = kMoeVariants[i];
+        if (v.kind == kind && v.K == K && v.MR == MR && v.P == P && v.RB == RB) return i;
+    }
+    return -1;
+}
+static int moe_threads(int kind, int P) { return kind == 0 ? 4 * P : 2 * P; }
+// compiled, T <= 32 at grf_size<256>, and T <= the device-reported limit when known
+static bool moe_usable(int kind, int K, int MR, int P, int RB) {
+    int i = moe_variant(kind, K, MR, P, RB);
+    if (i < 0) return false;
+    int T = moe_threads(kind, P);
+    if (moe_grf256(K, MR) && T > 32) return false;
+    return g_moe_wg_limit[i] < 0 || T <= g_moe_wg_limit[i];
+}
+static bool moe_gu_ok(int H, int K, int MR, int P) {
+    int tk = H / 16;
+    return P > 0 && tk % P == 0 && (tk / P) % 8 == 0 && moe_usable(0, K, MR, P, 0);
+}
+static int moe_dn_rb(int I, int P) { int rps = P > 0 ? (I / 16) / P : 0; return rps < 8 ? rps : 8; }
+static bool moe_dn_ok(int I, int K, int MR, int P) {
+    int tk = I / 16;
+    if (P <= 0 || tk % P) return false;
+    int rps = tk / P, RB = moe_dn_rb(I, P);
+    return RB > 0 && rps % RB == 0 && moe_usable(1, K, MR, P, RB);
+}
+
+static int g_gu_p = 0, g_dn_p = 0;   // moe_set_splits overrides; 0 = moe_plan's choice
+static int g_mr_override = 0;        // moe_set_mr override (grouped mode only); 0 = moe_plan's choice
+static int g_debug_skip = 0;
+static int g_pair_max_m = 4;   // M <= this: pair mode (no align launch)
+void moe_set_splits(int64_t gu_p, int64_t dn_p) {
+    TORCH_CHECK(gu_p >= 0 && dn_p >= 0, "moe_set_splits: P >= 0 (0 = moe_plan's choice)");
+    g_gu_p = (int)gu_p; g_dn_p = (int)dn_p;
+}
+void moe_set_pair_max_m(int64_t v) { g_pair_max_m = (int)v; }   // timing probes: bit0 gateup, bit1 down, bit2 combine, bit3 align
+void moe_set_debug(int64_t v) { g_debug_skip = (int)v; }
+void moe_set_mr(int64_t mr) {
+    TORCH_CHECK(mr >= 0, "moe_set_mr: MR >= 0 (0 = moe_plan's choice)");
+    g_mr_override = (int)mr;
+}
+
+// GEMV launch plan of one moe_forward call: {MR, gate|up P, down P, down RB}; MR = 0 means no kernel (moe_forward
+// raises). It includes the moe_set_mr / moe_set_splits overrides, which must be valid for the shape, else the plan
+// is empty. Defaults:
+//   K=3: MR 1 (pair mode, M <= 4) / 2 (M <= 64) / 4; gate|up P 5; down P 10 at M = 1, else 5 (the Flash-Next picks)
+//   K=4: MR as K=3; gate|up P 12 (pair mode) / 6 (M <= 64) / 4; down P = clamp((I/16)/8, 4, 16): 8 at I=1024,
+//        4 at I=512 and 256. Starting points: the M2 microbench picks the final ones.
+// A default that does not fit the shape (or a reported work-group limit) falls back to the nearest valid compiled
+// P (ties: the larger one), then to a smaller MR. K=3 at M >= prefill_min_m runs the DPAS prefill instead.
+struct MoePlan { int MR = 0, gu = 0, dn = 0, RB = 0; };
+
+static int moe_nearest_p(int kind, int HI, int K, int MR, int P0) {
+    int best = 0;
+    for (int i = 0; i < kNumMoeVariants; ++i) {
+        const MoeVariant& v = kMoeVariants[i];
+        if (v.kind != kind || v.K != K || v.MR != MR) continue;
+        if (!(kind == 0 ? moe_gu_ok(HI, K, MR, v.P) : moe_dn_ok(HI, K, MR, v.P))) continue;
+        int d = std::abs(v.P - P0), db = std::abs(best - P0);
+        if (!best || d < db || (d == db && v.P > best)) best = v.P;
+    }
+    return best;
+}
+
+static MoePlan moe_plan_impl(int H, int I, int K, int M) {
+    MoePlan pl;
+    if (M <= 0 || H <= 0 || I <= 0 || H % 128 || I % 128 || (K != 3 && K != 4)) return pl;
+    const bool pair = M <= g_pair_max_m;
+    int gu0, dn0;
+    if (K == 3) { gu0 = 5; dn0 = M <= 1 ? 10 : 5; }
+    else { gu0 = pair ? 12 : (M <= 64 ? 6 : 4); dn0 = std::min(16, std::max(4, (I / 16) / 8)); }
+    const bool mr_fixed = pair || g_mr_override > 0;
+    const int mr_first = pair ? 1 : (g_mr_override > 0 ? g_mr_override : (M <= 64 ? 2 : 4));
+    for (int MR = mr_first; MR >= 1; MR /= 2) {
+        int gu = g_gu_p > 0 ? (moe_gu_ok(H, K, MR, g_gu_p) ? g_gu_p : 0)
+                            : (moe_gu_ok(H, K, MR, gu0) ? gu0 : moe_nearest_p(0, H, K, MR, gu0));
+        int dn = g_dn_p > 0 ? (moe_dn_ok(I, K, MR, g_dn_p) ? g_dn_p : 0)
+                            : (moe_dn_ok(I, K, MR, dn0) ? dn0 : moe_nearest_p(1, I, K, MR, dn0));
+        if (gu && dn) { pl.MR = MR; pl.gu = gu; pl.dn = dn; pl.RB = moe_dn_rb(I, dn); return pl; }
+        if (mr_fixed) break;
+    }
+    return pl;
+}
+
+std::vector<int64_t> moe_plan(int64_t H, int64_t I, int64_t K, int64_t M) {
+    MoePlan p = moe_plan_impl((int)H, (int)I, (int)K, (int)M);
+    return {p.MR, p.gu, p.dn, p.RB};
+}
+
+template <typename KName>
+static void moe_kernel_limits(int64_t device, int64_t& wg, int64_t& priv) {
+    wg = -1; priv = -1;
+    if (device < 0) return;
+    auto& q = c10::xpu::getCurrentXPUStream((c10::DeviceIndex)device).queue();
+    sycl::device dev = q.get_device();
+    sycl::kernel_id id = sycl::get_kernel_id<KName>();
+    auto kb = sycl::get_kernel_bundle<sycl::bundle_state::executable>(q.get_context(), {dev}, {id});
+    sycl::kernel k = kb.get_kernel(id);
+    wg = (int64_t)k.get_info<sycl::info::kernel_device_specific::work_group_size>(dev);
+    priv = (int64_t)k.get_info<sycl::info::kernel_device_specific::private_mem_size>(dev);
+}
+
+// One row per compiled GEMV kernel, flattened: [fields, rows, row 0 ..., row 1 ..., ...] with
+//   row = [kind (0 gate|up, 1 down), K, MR, P, RB, dtype (gate|up input: 1 fp16, 2 bf16; down: 0), threads T,
+//          GRF (128 | 256), SLM bytes, work-group limit, private memory bytes per work-item]
+// device < 0: no device is touched and both limits are -1 (CPU-safe). device >= 0: every kernel is built for that
+// device (JIT) and queried (kernel_device_specific::work_group_size / private_mem_size, not the device-wide SIMT
+// limit); the limits are kept for moe_plan.
+std::vector<int64_t> moe_info(int64_t device) {
+    constexpr int64_t F = 11;
+    std::vector<int64_t> r{F, 0};
+    auto row = [&](int vi, int dt, int slm, int64_t wg, int64_t priv) {
+        TORCH_CHECK(vi >= 0, "moe_info: variant table mismatch");
+        const MoeVariant& v = kMoeVariants[vi];
+        r.insert(r.end(), {v.kind, v.K, v.MR, v.P, v.RB, dt, moe_threads(v.kind, v.P), moe_grf256(v.K, v.MR) ? 256 : 128,
+                           slm, wg, priv});
+        r[1] += 1;
+        if (wg >= 0) g_moe_wg_limit[vi] = g_moe_wg_limit[vi] < 0 ? wg : std::min(g_moe_wg_limit[vi], wg);
+    };
+    int64_t wg, pm;
+#define GUI(K_, MR_, P_) { int vi = moe_variant(0, K_, MR_, P_, 0); \
+        moe_kernel_limits<GateUpKernel<K_, MR_, P_, fp16>>(device, wg, pm); row(vi, 1, GateUpKernel<K_, MR_, P_, fp16>::SLM, wg, pm); \
+        moe_kernel_limits<GateUpKernel<K_, MR_, P_, bf16>>(device, wg, pm); row(vi, 2, GateUpKernel<K_, MR_, P_, bf16>::SLM, wg, pm); }
+#define DNI(K_, MR_, P_, RB_) { int vi = moe_variant(1, K_, MR_, P_, RB_); \
+        moe_kernel_limits<DownKernel<K_, MR_, P_, RB_>>(device, wg, pm); row(vi, 0, DownKernel<K_, MR_, P_, RB_>::SLM, wg, pm); }
+    MOE_GU_K3(GUI) MOE_DN_K3(DNI) MOE_GU_K4(GUI) MOE_DN_K4(DNI)
+#undef GUI
+#undef DNI
+    return r;
+}
 
 template <int K, int MR, int P, typename TIn>
 static void launch_gateup(sycl::queue& q, const TIn* x, int x_stride, const int64_t* ptrs, Route rt, fp16* abuf,
                           int H, int I, const Geom& gm, int max_act) {
+    TORCH_CHECK((H / 16) % P == 0 && ((H / 16) / P) % 8 == 0, "moe gateup: H/16 split");
     GateUpKernel<K, MR, P, TIn> k{x, x_stride, ptrs, rt, abuf, H, I, gm.off_suh_g(), gm.off_svh_g(), gm.off_suh_d(),
                                   (int)((gm.blob() - gm.off_suh_g()) / 4)};
     int T = 4 * P;
     size_t n = (size_t)max_act * (I / 128) * T;
-    q.submit([&](sycl::handler& h) { h.parallel_for(sycl::nd_range<1>(n, T), k); });
+    if constexpr (moe_grf256(K, MR)) {
+        sycl::ext::oneapi::experimental::properties props{sycl::ext::intel::experimental::grf_size<256>};
+        q.submit([&](sycl::handler& h) { h.parallel_for(sycl::nd_range<1>(n, T), props, k); });
+    } else {
+        q.submit([&](sycl::handler& h) { h.parallel_for(sycl::nd_range<1>(n, T), k); });
+    }
 }
 
-template <int K, int MR, int P>
+template <int K, int MR, int P, int RB>
 static void launch_down(sycl::queue& q, const fp16* abuf, const int64_t* ptrs, Route rt, float* y, int H, int I,
                         const Geom& gm, int max_act) {
-    constexpr int RB = DownKernel<K, MR, P>::RB;
     TORCH_CHECK((I / 16) % P == 0 && ((I / 16) / P) % RB == 0, "moe down: I/16 split");
-    DownKernel<K, MR, P> k{abuf, ptrs, rt, y, H, I, gm.gu_bytes(), gm.off_svh_d()};
+    DownKernel<K, MR, P, RB> k{abuf, ptrs, rt, y, H, I, gm.gu_bytes(), gm.off_svh_d()};
     int T = 2 * P;
     size_t n = (size_t)max_act * (H / 128) * T;
-    q.submit([&](sycl::handler& h) { h.parallel_for(sycl::nd_range<1>(n, T), k); });
+    if constexpr (moe_grf256(K, MR)) {
+        sycl::ext::oneapi::experimental::properties props{sycl::ext::intel::experimental::grf_size<256>};
+        q.submit([&](sycl::handler& h) { h.parallel_for(sycl::nd_range<1>(n, T), props, k); });
+    } else {
+        q.submit([&](sycl::handler& h) { h.parallel_for(sycl::nd_range<1>(n, T), k); });
+    }
 }
 
 template <int K, typename TIn>
-static void gateup_dispatch(int MR, sycl::queue& q, const TIn* x, int xs, const int64_t* ptrs, Route rt, fp16* abuf,
-                            int H, int I, const Geom& gm, int max_act) {
-#define GU(MRV, PV) if (MR == MRV && g_gu_p == PV) return launch_gateup<K, MRV, PV, TIn>(q, x, xs, ptrs, rt, abuf, H, I, gm, max_act);
-    GU(1, 10) GU(2, 10) GU(4, 10) GU(8, 5)
-    GU(1, 5) GU(2, 5) GU(4, 5) GU(1, 20) GU(2, 20)
+static void gateup_dispatch(int MR, int P, sycl::queue& q, const TIn* x, int xs, const int64_t* ptrs, Route rt,
+                            fp16* abuf, int H, int I, const Geom& gm, int max_act) {
+#define GU(KV, MRV, PV) if (MR == MRV && P == PV) return launch_gateup<KV, MRV, PV, TIn>(q, x, xs, ptrs, rt, abuf, H, I, gm, max_act);
+    if constexpr (K == 3) { MOE_GU_K3(GU) }
+    if constexpr (K == 4) { MOE_GU_K4(GU) }
 #undef GU
-    TORCH_CHECK(false, "moe gateup: unsupported MR/P ", MR, "/", g_gu_p);
+    TORCH_CHECK(false, "moe gateup: no kernel for K/MR/P ", K, "/", MR, "/", P);
 }
 
 template <int K>
-static void down_dispatch(int MR, sycl::queue& q, const fp16* abuf, const int64_t* ptrs, Route rt, float* y, int H,
-                          int I, const Geom& gm, int max_act) {
-#define DN(MRV, PV) if (MR == MRV && g_dn_p == PV) return launch_down<K, MRV, PV>(q, abuf, ptrs, rt, y, H, I, gm, max_act);
-    DN(1, 5) DN(2, 5) DN(4, 5) DN(8, 5)
-    DN(1, 10) DN(2, 10) DN(4, 10) DN(1, 20) DN(2, 20) DN(1, 40)
+static void down_dispatch(int MR, int P, int RB, sycl::queue& q, const fp16* abuf, const int64_t* ptrs, Route rt,
+                          float* y, int H, int I, const Geom& gm, int max_act) {
+#define DN(KV, MRV, PV, RBV) if (MR == MRV && P == PV && RB == RBV) return launch_down<KV, MRV, PV, RBV>(q, abuf, ptrs, rt, y, H, I, gm, max_act);
+    if constexpr (K == 3) { MOE_DN_K3(DN) }
+    if constexpr (K == 4) { MOE_DN_K4(DN) }
 #undef DN
-    TORCH_CHECK(false, "moe down: unsupported MR/P ", MR, "/", g_dn_p);
+    TORCH_CHECK(false, "moe down: no kernel for K/MR/P/RB ", K, "/", MR, "/", P, "/", RB);
 }
 
-static int g_mr_override = 0;
-static int g_debug_skip = 0;
-static int g_pair_max_m = 4;   // M <= this: pair mode (no align launch)
-void moe_set_pair_max_m(int64_t v) { g_pair_max_m = (int)v; }   // timing probes: bit0 gateup, bit1 down, bit2 combine, bit3 align
-void moe_set_debug(int64_t v) { g_debug_skip = (int)v; }
-void moe_set_mr(int64_t mr) { g_mr_override = (int)mr; }
+template <int K>
+static void gemv_layer(const MoePlan& pl, sycl::queue& q, const at::Tensor& x, const int64_t* pp, Route rt, fp16* ab,
+                       float* y, int H, int I, const Geom& gm, int max_act) {
+    if (!(g_debug_skip & 1)) {
+        if (x.scalar_type() == at::kHalf)
+            gateup_dispatch<K, fp16>(pl.MR, pl.gu, q, reinterpret_cast<const fp16*>(x.data_ptr()), x.stride(0), pp, rt,
+                                     ab, H, I, gm, max_act);
+        else
+            gateup_dispatch<K, bf16>(pl.MR, pl.gu, q, reinterpret_cast<const bf16*>(x.data_ptr()), x.stride(0), pp, rt,
+                                     ab, H, I, gm, max_act);
+    }
+    if (!(g_debug_skip & 2)) down_dispatch<K>(pl.MR, pl.dn, pl.RB, q, ab, pp, rt, y, H, I, gm, max_act);
+}
 
 // Routing tensors bundled as one int32 buffer so a caller can keep it across layers / replay it.
 struct RouteBufs {
@@ -866,7 +1065,7 @@ static void launch_ensure(sycl::queue& q, const int* ids, int npairs, int layer,
                 if (l == 0) fill_list[0] = 0;
                 return;
             }
-            for (int i = l; i < npairs; i += WG) need[ids[i]] = 1;
+            for (int i = l; i < npairs; i += WG) { int e = ids[i]; if (e >= 0) need[e] = 1; }   // -1: no expert
             sycl::group_barrier(g);
             const int T = sc[0];
             for (int e = l; e < E; e += WG) {
@@ -1187,10 +1386,16 @@ static at::Tensor moe_forward_impl(at::Tensor x, at::Tensor topk_ids, at::Tensor
     TORCH_CHECK(E <= 1024 && H % 128 == 0 && I % 128 == 0);
     auto out = at::empty_like(x);
     if (M == 0) return out;
+    TORCH_CHECK(K == 3 || K == 4, "moe: no kernels for K=", K, " in this build (K = 3, 4)");
+    TORCH_CHECK(x.scalar_type() == at::kHalf || x.scalar_type() == at::kBFloat16, "x dtype");
     auto& q = queue_of(x);
     Geom gm{H, (int)I, (int)K};
     int npairs = M * topk;
-    if (M >= g_prefill_min_m) return moe_prefill(x, topk_ids, topk_w, ptrs, gm, E, out);
+    // DPAS prefill: K=3 only (build4 needs 32 values per period); K=4 takes the GEMV path at every M
+    if (K == 3 && M >= g_prefill_min_m) return moe_prefill(x, topk_ids, topk_w, ptrs, gm, E, out);
+    const MoePlan pl = moe_plan_impl(H, (int)I, (int)K, M);
+    TORCH_CHECK(pl.MR > 0, "moe: no GEMV kernel for H=", H, " I=", I, " K=", K, " M=", M, " (overrides mr=",
+                g_mr_override, " gu_p=", g_gu_p, " dn_p=", g_dn_p, ")");
     bool pair_mode = M <= g_pair_max_m;
     auto rb = make_route(x, pair_mode ? 1 : npairs, E);
     if (pair_mode) {
@@ -1202,27 +1407,19 @@ static at::Tensor moe_forward_impl(at::Tensor x, at::Tensor topk_ids, at::Tensor
     int max_act = pair_mode ? npairs : std::min(npairs, E);
     auto abuf = at::empty({npairs, I}, x.options().dtype(at::kHalf));
     auto y = at::empty({npairs, H}, x.options().dtype(at::kFloat));
-    // rows per expert chunk: 1 at M=1, else up to 4 (8 for bigger batches)
+    // rows per expert chunk (pl.MR): 1 in pair mode, else 2 up to M=64, then 4 (moe_plan).
     // B70, layer-0 experts, device slots: grouped M=16 MR=1/2/4 = 723/693/734 us; pair mode wins M<=4 (no align).
-    int MR = pair_mode ? 1 : g_mr_override ? g_mr_override : (M <= 64 ? 2 : 4);
+    // K=3 down P: M=2: P=10 120.9 us vs P=5 112.8.
     const int64_t* pp = ptrs.data_ptr<int64_t>();
     fp16* ab = reinterpret_cast<fp16*>(abuf.data_ptr());
-    TORCH_CHECK(K == 3, "moe: K=3 only in this build");
-    if (g_debug_skip & 1) {}
-    else if (x.scalar_type() == at::kHalf)
-        gateup_dispatch<3, fp16>(MR, q, reinterpret_cast<const fp16*>(x.data_ptr()), x.stride(0), pp, rb.rt, ab, H, I, gm, max_act);
-    else if (x.scalar_type() == at::kBFloat16)
-        gateup_dispatch<3, bf16>(MR, q, reinterpret_cast<const bf16*>(x.data_ptr()), x.stride(0), pp, rb.rt, ab, H, I, gm, max_act);
-    else TORCH_CHECK(false, "x dtype");
-    int dn_p_save = g_dn_p;
-    if (g_dn_p == 0) g_dn_p = M <= 1 ? 10 : 5;   // M=2: P=10 120.9 us vs P=5 112.8
-    if (!(g_debug_skip & 2)) down_dispatch<3>(MR, q, ab, pp, rb.rt, y.data_ptr<float>(), H, I, gm, max_act);
-    g_dn_p = dn_p_save;
+    if (K == 3) gemv_layer<3>(pl, q, x, pp, rb.rt, ab, y.data_ptr<float>(), H, (int)I, gm, max_act);
+    else gemv_layer<4>(pl, q, x, pp, rb.rt, ab, y.data_ptr<float>(), H, (int)I, gm, max_act);
     int n = M * (H / 128), local = 8;
+    const int* pair_ids = pair_mode ? topk_ids.data_ptr<int>() : nullptr;   // pair mode: combine skips -1 ids
     auto run_c = [&](auto tag) {
         using TO = decltype(tag);
         CombineKernel<TO> ck{y.data_ptr<float>(), rb.pair_of, reinterpret_cast<TO*>(out.data_ptr()), M, H, topk, (int)out.stride(0),
-                             commit_ptrs, commit_fill, fill_list};
+                             commit_ptrs, commit_fill, fill_list, pair_ids};
         q.submit([&](sycl::handler& h) { h.parallel_for(sycl::nd_range<1>((n + local - 1) / local * local, local), ck); });
     };
     if (!(g_debug_skip & 4)) { if (x.scalar_type() == at::kHalf) run_c(fp16{}); else run_c(bf16{}); }
@@ -1492,6 +1689,8 @@ TORCH_LIBRARY(exl3xpu_moe, m) {
     m.def("usm_kind(int ptr) -> int", &moe::usm_kind);
     m.def("memcpy_async(int dst, int src, int nbytes) -> ()", &moe::memcpy_async);
     m.def("blob_bytes(int H, int I, int K) -> int", &moe::blob_bytes);
+    m.def("moe_plan(int H, int I, int K, int M) -> int[]", &moe::moe_plan);
+    m.def("moe_info(int device=-1) -> int[]", &moe::moe_info);
     m.def("qsa_decode_select(Tensor q, Tensor cache, Tensor page_table, Tensor lengths, Tensor(a!) scratch, Tensor(b!) out, int topk, int real_heads) -> ()");
     m.impl("qsa_decode_select", torch::kXPU, &moe::qsa_decode_select);
     m.def("ngram_gather_dequant(Tensor ids, Tensor chunk_ptrs, int rows_per_chunk, int num_rows, int words, int K, Tensor head_bias, Tensor(a!) out) -> ()");

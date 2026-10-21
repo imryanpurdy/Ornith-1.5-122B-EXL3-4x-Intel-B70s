@@ -671,6 +671,7 @@ static void launch_reconstruct_q8(const at::Tensor& tr, at::Tensor& w, int n0, s
 void exl3_reconstruct(at::Tensor trellis, at::Tensor w, int64_t n0, int64_t K, int64_t cb) {
     TORCH_CHECK(w.scalar_type() == at::kHalf && w.is_contiguous() && w.size(1) % 128 == 0 && n0 % 128 == 0);
     TORCH_CHECK(w.size(0) == trellis.size(0) * 16 && n0 + w.size(1) <= trellis.size(1) * 16);
+    TORCH_CHECK(trellis.is_contiguous(), "exl3_reconstruct: trellis must be contiguous (.contiguous() after narrow)");
     auto& q = queue_of(w);
     bool ok = true;
     if (K == 4 && cb == 2) launch_reconstruct<4, 2>(trellis, w, n0, q);
@@ -780,9 +781,17 @@ static at::Tensor& weight_scratch(const at::Device& dev, int64_t numel) {
     return b;
 }
 
+// Grow the reconstruct scratch of XPU `device` to >= numel fp16 once at load time, so no serving call allocates it.
+void exl3_reserve_scratch(int64_t device, int64_t numel) {
+    TORCH_CHECK(device >= 0 && numel >= 0, "exl3_reserve_scratch: device >= 0, numel >= 0");
+    weight_scratch(at::Device(at::kXPU, (c10::DeviceIndex)device), numel);
+}
+
 at::Tensor exl3_linear(at::Tensor x, at::Tensor trellis, at::Tensor suh, at::Tensor svh, at::Tensor shard_of_nb,
                        std::vector<int64_t> group_bounds, int64_t K, int64_t cb, int64_t small_m_max,
                        int64_t slice_n) {
+    TORCH_CHECK(trellis.is_contiguous() && suh.is_contiguous() && svh.is_contiguous() && shard_of_nb.is_contiguous(),
+                "exl3 linear: trellis, suh, svh, shard_of_nb must be contiguous (.contiguous() after narrow)");
     auto shape = x.sizes().vec();
     int64_t k = shape.back();
     int64_t n = svh.size(0);
@@ -971,6 +980,7 @@ TORCH_LIBRARY(exl3xpu_C, m) {
     m.impl("exl3_had_out_h", torch::kXPU, &exl3_had_out_h);
     m.def("exl3_reconstruct(Tensor trellis, Tensor(a!) w, int n0, int K, int cb) -> ()");
     m.impl("exl3_reconstruct", torch::kXPU, &exl3_reconstruct);
+    m.def("exl3_reserve_scratch(int device, int numel) -> ()", &exl3_reserve_scratch);
     m.def("exl3_gemm_raw(Tensor xh_blocked, Tensor trellis, Tensor shard_of_nb, int N, int K, int cb, int path) -> Tensor");
     m.impl("exl3_gemm_raw", torch::kXPU, &exl3_gemm_raw);
     m.def("exl3_set_target_threads(int n) -> ()", &exl3_set_target_threads);
