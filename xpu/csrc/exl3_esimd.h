@@ -645,15 +645,12 @@ struct DpasKernel {
 #endif
     static constexpr int NL = G * NT;      // lanes over the thread's NT tiles
     static constexpr int NPL = D + 1;      // plane 0: word D*grp - 1 (circular in the tile); plane 1 + i: word D*grp + i
-#ifndef EXL3_WIDE_TPG8
-#define EXL3_WIDE_TPG8 4                   // MB <= 8: four K=5 tiles (32 lanes) per build pass
-#endif
 #ifndef EXL3_WIDE_TPG
-#define EXL3_WIDE_TPG 2                    // larger MB: two tiles per pass (accumulators + B operands fit 128/256 GRF)
+#define EXL3_WIDE_TPG 4                    // tiles per build pass, capped at 32 lanes and at NT (K=5: MB8/16 4, MB24+ 2)
 #endif
-    static constexpr int TPG_RAW = MB <= 8 ? EXL3_WIDE_TPG8 : EXL3_WIDE_TPG;
     static constexpr int TPG_CAP = (32 / G) < 1 ? 1 : (32 / G);
-    static constexpr int TPG = TPG_RAW < TPG_CAP ? (TPG_RAW < NT ? TPG_RAW : NT) : (TPG_CAP < NT ? TPG_CAP : NT);
+    static constexpr int TPG_LIM = EXL3_WIDE_TPG < TPG_CAP ? EXL3_WIDE_TPG : TPG_CAP;
+    static constexpr int TPG = TPG_LIM < NT ? TPG_LIM : NT;
     static_assert(!WIDE || NT % TPG == 0, "NT must be a multiple of the wide build pass");
 
     // plane reads for one pass: lanes [OFF, OFF + G*TPG) of every plane
