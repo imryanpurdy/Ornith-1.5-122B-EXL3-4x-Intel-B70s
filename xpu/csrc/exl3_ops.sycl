@@ -171,21 +171,44 @@ static bool dispatch_dpas(int MB, const at::Tensor& xh, const at::Tensor& tr, co
 #define EXL3_DPAS24_NT 2
 #endif
 static int dpas_nt(int MB) { return MB == 4 ? EXL3_DPAS4_NT : MB == 8 ? EXL3_DPAS8_NT : MB == 24 ? EXL3_DPAS24_NT : (MB == 40 || MB == 48) ? 2 : (MB <= 16 ? 4 : (MB == 32 ? EXL3_DPAS32_NT : EXL3_DPAS64_NT)); }
-// GEMV / DPAS cut-over, per trellis bit width K: rows M <= vec_max_m(K) run GemvKernel (MR1/2/4/8), larger M runs
-// DpasKernel. Default table (measured on one B70 with the Ornith-1.5-122B EXL3 tensors):
-//   K=5 -> 8: M=3..8 go to GEMV MR4 (M=3-4) / MR8 (M=5-8), both NT=4. K=5 DPAS builds its B operand from 8-lane
-//             vectors x 32 steps (DpasKernel::build, exl3_esimd.h) and is 1.67-1.91x K=4 at M=3-8, slower than K=6;
-//             K=5 GEMV pairs 4 tiles per vector op (32 lanes) and is 20-37% faster than K=5 DPAS there.
-//   others -> 2: K=4/K=6 GEMV MR4/MR8 (NT=2) are 1.6-2.4x slower than DPAS MB8 on the large shapes.
-// Knobs: exl3_set_vec_max_m(n) with n >= 0 still forces one cut-over for every K (the old global knob);
-// n < 0 drops that override and returns to the per-K table. exl3_set_vec_max_m_k(K, n) edits one table entry
-// (n < 0 restores its default). GemvKernel has at most 8 rows (MR8), so any cut-over is capped at 8.
+// GEMV / DPAS cut-over, per trellis bit width K and weight shape. Rows M <= vec_max_m(K) may run GemvKernel
+// (MR1/2/4/8); larger M runs DpasKernel. Up to 2 rows GEMV is always used. Above 2 rows GEMV also needs the weight
+// (Kdim x N) to fit that block's limits: MR4 (3..4 rows) and MR8 (5..8 rows) each have a Kdim limit and a Kdim * N
+// limit. Defaults, measured on one B70 against the wide K=5 DPAS build (exl3_esimd.h build_wide) with the
+// Ornith-1.5-122B EXL3 tensors and their TP4 slices, GEMV vs DPAS interleaved in one process (graph replay):
+//   K=5, 3..4 rows: GEMV when Kdim * N <= 3072 x 4096 (12.6M weights). GEMV MR4 is 2-12% faster on every measured
+//        shape up to that size (shared-expert and expert-width tensors, TP4 o/out_proj, q_proj and k/v slices; at
+//        M=3 the 256-768 wide ones tie within 2%); from the TP4 qkv slice (14.2M) up, DPAS ties or wins.
+//   K=5, 5..8 rows: GEMV only when Kdim <= 256 (the TP4 shared-expert down slice, 256 -> 3072: 5-6% faster).
+//        Everywhere else GEMV MR8 ties (Kdim 1024-2048) or loses by 4-15% (Kdim >= 3072).
+//   K=4, K=6 -> 2 rows. K=4 GEMV MR4/MR8 is slower than DPAS MB8 on every shape; K=6 GEMV MR4 is 4-12% faster on
+//        small weights, but Ornith's only K=6 tensor is lm_head, where DPAS wins, so K=6 keeps DPAS.
+// Knobs: exl3_set_vec_max_m(n) with n >= 0 forces one cut-over for every K and every shape (the old global knob,
+// for benches); n < 0 drops that override. exl3_set_vec_max_m_k(K, n) edits one table entry (n < 0 restores its
+// default; 2 turns the K=5 small-shape GEMV route off). exl3_set_vec_limit(K, MR, kdim_max, kn_max) edits the shape
+// limits of MR 4 or 8 (a negative value restores that field's default). GemvKernel has at most 8 rows (MR8), so any
+// cut-over is capped at 8.
 static constexpr std::array<int, 9> kVecMaxMDefault = {2, 2, 2, 2, 2, 8, 2, 2, 2};   // index = K
 static std::array<int, 9> g_vec_max_m_k = kVecMaxMDefault;
-static int g_vec_max_m = -1;  // global override for every K; -1 = use the per-K table
+struct VecLimit { long long kdim_max, kn_max; };
+static constexpr long long kNoLimit = 1LL << 62;
+static constexpr VecLimit kVecFree{kNoLimit, kNoLimit};
+// [K][0] = MR4 (3..4 rows), [K][1] = MR8 (5..8 rows). Only K=5 has finite defaults; other K use the table alone.
+static constexpr std::array<std::array<VecLimit, 2>, 9> kVecLimitDefault = {{
+    {kVecFree, kVecFree}, {kVecFree, kVecFree}, {kVecFree, kVecFree}, {kVecFree, kVecFree}, {kVecFree, kVecFree},
+    {VecLimit{kNoLimit, 3072LL * 4096}, VecLimit{256, kNoLimit}},
+    {kVecFree, kVecFree}, {kVecFree, kVecFree}, {kVecFree, kVecFree}}};
+static std::array<std::array<VecLimit, 2>, 9> g_vec_limit = kVecLimitDefault;
+static int g_vec_max_m = -1;  // global override for every K and shape; -1 = use the per-K rule
 static int vec_max_m_for(int K) {
     int v = g_vec_max_m >= 0 ? g_vec_max_m : ((K >= 0 && K <= 8) ? g_vec_max_m_k[K] : 2);
     return v > 8 ? 8 : v;
+}
+static bool use_gemv(int M, int K, int Kdim, int N) {
+    if (M > vec_max_m_for(K)) return false;
+    if (g_vec_max_m >= 0 || M <= 2 || K < 0 || K > 8) return true;
+    const VecLimit& l = g_vec_limit[K][M <= 4 ? 0 : 1];
+    return (long long)Kdim <= l.kdim_max && (long long)Kdim * (long long)N <= l.kn_max;
 }
 
 // Split-K sizing: threads to aim for when choosing the number of K splits. Measured on B70 (all linears,
@@ -254,8 +277,15 @@ struct SmallPlan {
 //    4-5% faster on the cells where it differs). Steps 1 and 2 are already balanced on every Ornith shape.
 static constexpr int kResidentThreads256 = 1024;   // 256-GRF ESIMD threads resident on the B70 (32 Xe cores)
 static constexpr int kRpsGrid[] = {1, 2, 3, 4, 5, 6, 8, 10, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 512};
+// a = us per tile-row per wave; index = K, 0.90 for K without a fit. Fitted per K on the MB40-64 curves of the old
+// DPAS kernels. Re-checked on the wide K=5/K=6 DPAS build (200 MB40-64 split-K curves, K=5/6, 20 shapes incl. TP4
+// slices, M=40-128): the least-squares slope drops to ~0.66, but as a decision rule a grid over a = 0.5..1.5 is best
+// at a = 1.05-1.10 for K=5 and 0.89-0.90 for K=6 (smaller a picks deeper splits and is 1-5% slower), so the
+// constants stay. exl3_set_wave_a(K, a_milli) overrides one (tuning only).
+static constexpr std::array<double, 9> kWaveADefault = {0.90, 0.90, 0.90, 0.90, 0.67, 1.05, 0.89, 0.90, 0.90};
+static std::array<double, 9> g_wave_a = kWaveADefault;
 static double wave_cost(int K, int units, int tk, int M, int N, int rps) {
-    const double a = K == 4 ? 0.67 : (K == 5 ? 1.05 : (K == 6 ? 0.89 : 0.90));   // us per tile-row per wave (fit)
+    const double a = (K >= 0 && K <= 8) ? g_wave_a[K] : 0.90;
     int P = (tk + rps - 1) / rps;
     int r = (tk + P - 1) / P;
     double waves = std::ceil((double)units * P / (double)kResidentThreads256);
@@ -263,7 +293,7 @@ static double wave_cost(int K, int units, int tk, int M, int N, int rps) {
 }
 static SmallPlan plan_small(int M, int K, int Kdim, int N) {
     SmallPlan p{};
-    p.vec = M <= vec_max_m_for(K) ? 1 : 0;
+    p.vec = use_gemv(M, K, Kdim, N) ? 1 : 0;
     p.MR = mr_for(M);
     p.MB = mb_for(M);
     p.m_blocks = p.vec ? 1 : (M + p.MB - 1) / p.MB;
@@ -887,11 +917,31 @@ void exl3_set_vec_max_m_k(int64_t K, int64_t n) {
 }
 // Effective cut-over for K (override or table, capped at 8).
 int64_t exl3_get_vec_max_m(int64_t K) { return vec_max_m_for((int)K); }
+// Shape limits for GEMV at MR4 (3..4 rows) or MR8 (5..8 rows): Kdim <= kdim_max and Kdim * N <= kn_max.
+// A negative value restores that field's default.
+void exl3_set_vec_limit(int64_t K, int64_t MR, int64_t kdim_max, int64_t kn_max) {
+    TORCH_CHECK(K >= 0 && K <= 8, "exl3_set_vec_limit: K out of range");
+    TORCH_CHECK(MR == 4 || MR == 8, "exl3_set_vec_limit: MR must be 4 or 8");
+    const int i = MR == 4 ? 0 : 1;
+    g_vec_limit[K][i].kdim_max = kdim_max < 0 ? kVecLimitDefault[K][i].kdim_max : (long long)kdim_max;
+    g_vec_limit[K][i].kn_max = kn_max < 0 ? kVecLimitDefault[K][i].kn_max : (long long)kn_max;
+}
+std::vector<int64_t> exl3_get_vec_limit(int64_t K, int64_t MR) {
+    TORCH_CHECK(K >= 0 && K <= 8, "exl3_get_vec_limit: K out of range");
+    TORCH_CHECK(MR == 4 || MR == 8, "exl3_get_vec_limit: MR must be 4 or 8");
+    const VecLimit& l = g_vec_limit[K][MR == 4 ? 0 : 1];
+    return {(int64_t)l.kdim_max, (int64_t)l.kn_max};
+}
 // Split-K rule knobs (plan_small): narrow-N guard coefficient in percent (40 = rps >= ceil(0.40 sqrt(tk)); 0 = off),
 // and the MB40-64 wave model (1 = on, 0 = off). n < 0 leaves a knob unchanged. Both off = the old target-only rule.
 void exl3_set_split_rule(int64_t alpha_pct, int64_t wave) {
     if (alpha_pct >= 0) g_split_alpha_pct = (int)alpha_pct;
     if (wave >= 0) g_split_wave = wave != 0;
+}
+// Tuning only: the wave model's per-K slope a, in 1/1000 us per tile-row per wave (n < 0 restores the default).
+void exl3_set_wave_a(int64_t K, int64_t a_milli) {
+    TORCH_CHECK(K >= 0 && K <= 8, "exl3_set_wave_a: K out of range");
+    g_wave_a[K] = a_milli < 0 ? kWaveADefault[K] : (double)a_milli / 1000.0;
 }
 // Tuning only: pin rows-per-split for every small-M call (0 = use the rule).
 void exl3_set_force_rps(int64_t n) { g_force_rps = n > 0 ? (int)n : 0; }
@@ -929,8 +979,11 @@ TORCH_LIBRARY(exl3xpu_C, m) {
     m.def("exl3_set_vec_max_m(int n) -> ()", &exl3_set_vec_max_m);
     m.def("exl3_set_vec_max_m_k(int K, int n) -> ()", &exl3_set_vec_max_m_k);
     m.def("exl3_get_vec_max_m(int K) -> int", &exl3_get_vec_max_m);
+    m.def("exl3_set_vec_limit(int K, int MR, int kdim_max, int kn_max) -> ()", &exl3_set_vec_limit);
+    m.def("exl3_get_vec_limit(int K, int MR) -> int[]", &exl3_get_vec_limit);
     m.def("exl3_set_split_rule(int alpha_pct, int wave) -> ()", &exl3_set_split_rule);
     m.def("exl3_set_force_rps(int n) -> ()", &exl3_set_force_rps);
+    m.def("exl3_set_wave_a(int K, int a_milli) -> ()", &exl3_set_wave_a);
     m.def("exl3_plan(int M, int K, int k, int n) -> int[]", &exl3_plan);
     m.def("exl3_set_fused(int on) -> ()", &exl3_set_fused);
     m.def("exl3_set_local(int n) -> ()", &exl3_set_local);
