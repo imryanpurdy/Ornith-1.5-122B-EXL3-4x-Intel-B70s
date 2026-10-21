@@ -626,6 +626,94 @@ struct DpasKernel {
     static constexpr int RHS = PLANAR ? P : D * P;
     static constexpr int RPS = PLANAR ? G : 1;
 
+    // ---- Wide B build (default for K=5 at every MB and for K=6 at MB >= 16; EXL3_K5_NARROW / EXL3_K6_NARROW restore
+    // build<u>; EXL3_WIDE6 also takes K=6 MB8 wide, which measured 0.96-1.11x, i.e. no clear win, on the B70).
+    // build<u> decodes one tile at a time with G lanes (K=5: G=8, i.e. 32 SIMD8 steps per tile), and its planar
+    // de-interleave of the D-word periods costs per-element moves (stride D is not a legal register region).
+    // Here one lane is one (tile, period) pair across TPG tiles: lane L = G*j + 8*b + a <-> tile j, period
+    // grp = P*a + b. The planes come straight from memory in that layout (LSC gather with vector size = SoA
+    // result, no register shuffles), every lane of a step shares u (so shifts are immediates), and one op
+    // covers G*TPG values (K=5: 32 lanes = 4 tiles). Same states, same decode, same VNNI positions as build<u>,
+    // so the B operands are bit-identical.
+#ifdef EXL3_K5_NARROW
+    static constexpr bool WIDE5 = false;
+#else
+    static constexpr bool WIDE5 = K == 5 && V == 32 && CB == 2 && !FUSED;
+#endif
+#if defined(EXL3_K6_NARROW)
+    static constexpr bool WIDE6 = false;
+#elif defined(EXL3_WIDE6)
+    static constexpr bool WIDE6 = K == 6 && V == 16 && CB == 2 && !FUSED;
+#else
+    static constexpr bool WIDE6 = K == 6 && V == 16 && CB == 2 && !FUSED && MB >= 16;
+#endif
+    static constexpr bool WIDE = WIDE5 || WIDE6;
+    static constexpr int NL = G * NT;      // lanes over the thread's NT tiles
+    static constexpr int NPL = D + 1;      // plane 0: word D*grp - 1 (circular in the tile); plane 1 + i: word D*grp + i
+#ifndef EXL3_WIDE_TPG
+#define EXL3_WIDE_TPG 4                    // tiles per build pass, capped at 32 lanes and at NT (K=5: MB8/16 4, MB24+ 2)
+#endif
+    static constexpr int TPG_CAP = (32 / G) < 1 ? 1 : (32 / G);
+    static constexpr int TPG_LIM = EXL3_WIDE_TPG < TPG_CAP ? EXL3_WIDE_TPG : TPG_CAP;
+    static constexpr int TPG = TPG_LIM < NT ? TPG_LIM : NT;
+    static_assert(!WIDE || NT % TPG == 0, "NT must be a multiple of the wide build pass");
+
+    // plane reads for one pass: lanes [OFF, OFF + G*TPG) of every plane
+    template <int u, int OFF, int TPGp, class PT, class BT>
+    static ESIMD_INLINE void build_wide(PT& pl, BT& Bw) {
+        if constexpr (u < V) {
+            constexpr int NLp = G * TPGp;
+            constexpr int e = (u + 1) * K;
+            constexpr int i1 = (e - 1) / 32;
+            constexpr int b0 = e - 16;
+            constexpr int i0 = b0 >= 0 ? b0 / 32 : -1;
+            constexpr int s = (i1 + 1) * 32 - e;
+            auto lo = pl.template select<NLp, 1>((1 + i1) * NL + OFF);
+            simd<uint16_t, NLp> st;   // only the state's low 16 bits are ever used
+            if constexpr (NLp >= 32) {
+                // 32 lanes: half-word ops (one GRF per operand). A window that crosses into lo ends in lo's high half
+                // (s > 16), so both shifts work on half-words; s >= 16 likewise needs only lo's high half.
+                if constexpr (i0 == i1) {
+                    if constexpr (s == 0) st = lo.template bit_cast_view<uint16_t>().template select<NLp, 2>(0);
+                    else if constexpr (s >= 16)
+                        st = simd<uint16_t, NLp>(lo.template bit_cast_view<uint16_t>().template select<NLp, 2>(1)) >> (s - 16);
+                    else st = convert<uint16_t>(simd<uint32_t, NLp>(lo) >> s);
+                } else {
+                    static_assert(s > 16, "two-word window ends in the high half");
+                    auto hi = pl.template select<NLp, 1>((1 + i0) * NL + OFF);   // i0 = -1: plane 0
+                    simd<uint16_t, NLp> hl = hi.template bit_cast_view<uint16_t>().template select<NLp, 2>(0);
+                    simd<uint16_t, NLp> lh = lo.template bit_cast_view<uint16_t>().template select<NLp, 2>(1);
+                    st = (hl << (32 - s)) | (lh >> (s - 16));
+                }
+            } else {
+                // 16 lanes: dword ops (half-word SIMD16 ops with strided sources get repacked by IGC)
+                simd<uint32_t, NLp> sd;
+                if constexpr (i0 == i1) sd = simd<uint32_t, NLp>(lo) >> s;
+                else {
+                    simd<uint32_t, NLp> hi = pl.template select<NLp, 1>((1 + i0) * NL + OFF);
+                    if constexpr (s == 0) sd = lo;
+                    else sd = (hi << (32 - s)) | (simd<uint32_t, NLp>(lo) >> s);
+                }
+                st = convert<uint16_t>(sd);
+            }
+            // mul1 codebook bits: fp16(1024 + byte sum) in each lane's low half (decode_mul1_raw). They move straight
+            // into the VNNI positions (value t = V*grp + u at 32*(R + MS*b) + C0 + 2*a, build<u>'s placement); the
+            // affine runs once per finished B operand, packed (wide_passes), so no per-step repacking.
+            simd<uint32_t, NLp> bs = dp4a<uint32_t, uint32_t, uint32_t, uint32_t, NLp>(
+                simd<uint32_t, NLp>(0x6400u), convert<uint32_t>(st) * 0x83DCD12Du, simd<uint32_t, NLp>(0x01010101u));
+            auto hv = bs.template bit_cast_view<fp16>();
+            constexpr int h = (u >> 2) & 1;
+            constexpr int R = 4 * ((u >> 1) & 1) + ((u >> 3) & 3);
+            constexpr int C0 = 16 * h + (u & 1);
+#pragma unroll
+            for (int j = 0; j < TPGp; ++j)
+#pragma unroll
+                for (int b = 0; b < P; ++b)
+                    Bw.template select<8, 2>(256 * j + 32 * (R + MS * b) + C0) = hv.template select<8, 2>(2 * (G * j + 8 * b));
+            build_wide<u + 1, OFF, TPGp>(pl, Bw);
+        }
+    }
+
     template <int u, class BT>
     static ESIMD_INLINE void build(simd<uint32_t, W>& dw, simd<uint32_t, W>& dwprev, BT&& Bv) {
         if constexpr (u < V) {
@@ -716,6 +804,44 @@ struct DpasKernel {
       }
     }
 
+    // FOLD: sum_k a_k per row, on the (idle) XMX unit: one dpas against an all-ones B per row block
+    template <class AT>
+    static ESIMD_INLINE void fold_rowsums(simd<fp16, MB * 16>& Am, AT& accs) {
+        constexpr int RC = MB < 8 ? MB : 8;
+        simd<fp16, 256> ones = fp16(1.0f);
+#pragma unroll
+        for (int rb = 0; rb < MB / RC; ++rb) {
+            auto c = accs.template select<RC * 16, 1>(rb * RC * 16);
+            c = xmx::dpas<8, RC, float, float, fp16, fp16>(
+                simd<float, RC * 16>(c), ones, simd<fp16, RC * 16>(Am.template select<RC * 16, 1>(rb * RC * 16)));
+        }
+    }
+
+    // wide path: NT / TPG build passes per tile-row, each decoding TPG tiles' B operands and issuing their DPAS
+    template <int PASS>
+    static ESIMD_INLINE void wide_passes(simd<uint32_t, NPL * NL>& pl, simd<fp16, MB * 16>& Am,
+                                         simd<float, MB * 16 * NT>& acc) {
+        if constexpr (PASS < NT / TPG) {
+            simd<fp16, 256 * TPG> Bw;
+            build_wide<0, PASS * G * TPG, TPG>(pl, Bw);
+            // decode_cb_h<2>'s __hfma (one fp16 rounding) on the raw codebook halves; FOLD applies it to the dot product
+            if constexpr (!FOLD) Bw = Bw * fp16(0.00676727294921875f) + fp16(-10.3828125f);
+            constexpr int RC = MB < 8 ? MB : 8;
+#pragma unroll
+            for (int jj = 0; jj < TPG; ++jj) {
+                int j = PASS * TPG + jj;
+#pragma unroll
+                for (int rb = 0; rb < MB / RC; ++rb) {
+                    auto c = acc.template select<RC * 16, 1>((j * MB + rb * RC) * 16);
+                    c = xmx::dpas<8, RC, float, float, fp16, fp16>(
+                        simd<float, RC * 16>(c), simd<fp16, 256>(Bw.template select<256, 1>(256 * jj)),
+                        simd<fp16, RC * 16>(Am.template select<RC * 16, 1>(rb * RC * 16)));
+                }
+            }
+            wide_passes<PASS + 1>(pl, Am, acc);
+        }
+    }
+
     void operator()(sycl::nd_item<1> it) const SYCL_ESIMD_KERNEL {
         int id = it.get_global_id(0);
         int strip = id % n_strips;
@@ -760,6 +886,34 @@ struct DpasKernel {
                             c = xmx::dpas<8, 8, float, float, fp16, fp16>(simd<float, 128>(c), Bv, Am);
                         }
                 }
+            }
+        } else if constexpr (WIDE) {
+            const fp16* xbase = xh + (size_t)shard * Mp * Kdim;   // blocked [k/16][Mp][16], pad rows zero
+            // per-lane byte offsets of each lane's period (lane L = G*j + 8*b + a: tile j, period grp = P*a + b)
+            simd<uint32_t, NL> lane(0, 1);
+            simd<uint32_t, NL> lj = lane / G, lb = (lane % G) / 8, la = lane % 8;
+            simd<uint32_t, NL> wofs = lj * W + (la * P + lb) * D;        // first word of the period
+            simd<uint32_t, NL> qw = wofs + (W - 1);                       // period 0: the tile's last word
+            qw.merge(wofs - 1u, (la * P + lb) != 0u);                     // else the previous period's last word
+            simd<uint32_t, NL> offP = wofs * 4u, offQ = qw * 4u;
+            for (int r = r0; r < r1; ++r) {
+                size_t t0 = (size_t)r * tiles_n + tile_n0;
+                const uint32_t* rp = tr + t0 * W;
+#ifdef EXL3_L1_PF
+                if (r + EXL3_PF_DIST < r1) pf_words<NT * W>(tr + (t0 + (size_t)EXL3_PF_DIST * tiles_n) * W);
+#endif
+                // planes, SoA: pl[(1 + i) * NL + L] = word D*grp + i, pl[L] = circular previous word
+                simd<uint32_t, NPL * NL> pl;
+                pl.template select<NL, 1>(0) = gather<uint32_t, NL>(rp, offQ);
+                if constexpr (D <= 4) {
+                    pl.template select<D * NL, 1>(NL) = gather<uint32_t, D * NL, D>(rp, offP);
+                } else {
+                    pl.template select<4 * NL, 1>(NL) = gather<uint32_t, 4 * NL, 4>(rp, offP);
+                    pl.template select<(D - 4) * NL, 1>(5 * NL) = gather<uint32_t, (D - 4) * NL, D - 4>(rp + 4, offP);
+                }
+                simd<fp16, MB * 16> Am = block_load<fp16, MB * 16>(xbase + ((size_t)r * Mp + m0) * 16);
+                wide_passes<0>(pl, Am, acc);
+                if constexpr (FOLD) fold_rowsums(Am, accs);
             }
         } else {
         const fp16* xbase = xh + (size_t)shard * Mp * Kdim;   // blocked [k/16][Mp][16], pad rows zero
@@ -830,17 +984,7 @@ struct DpasKernel {
                         simd<float, RC * 16>(c), simd<fp16, 256>(Bv), simd<fp16, RC * 16>(Am.template select<RC * 16, 1>(rb * RC * 16)));
                 }
             }
-            if constexpr (FOLD) {
-                // sum_k a_k per row, on the (idle) XMX unit: one dpas against an all-ones B per row block
-                constexpr int RC = MB < 8 ? MB : 8;
-                simd<fp16, 256> ones = fp16(1.0f);
-#pragma unroll
-                for (int rb = 0; rb < MB / RC; ++rb) {
-                    auto c = accs.template select<RC * 16, 1>(rb * RC * 16);
-                    c = xmx::dpas<8, RC, float, float, fp16, fp16>(
-                        simd<float, RC * 16>(c), ones, simd<fp16, RC * 16>(Am.template select<RC * 16, 1>(rb * RC * 16)));
-                }
-            }
+            if constexpr (FOLD) fold_rowsums(Am, accs);
         }
         }
 #pragma unroll
