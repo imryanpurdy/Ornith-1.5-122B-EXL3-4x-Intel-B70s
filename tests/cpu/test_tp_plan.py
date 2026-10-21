@@ -276,6 +276,18 @@ def test_dispatch_matches_kind_functions():
     assert whole.cols == ((512, 512), (1536, 512))
 
 
+def test_attn_output_gate_default_matches_vllm():
+    """vLLM's Qwen3-Next/3.5 attention builds qkv_proj with attn_output_gate=True when the config omits the key."""
+    cfg = {k: v for k, v in CFG.items() if k != "attn_output_gate"}
+    for r in range(4):
+        p = tp.qwen35_plan(P + "3.self_attn.q_proj", H, 16384, cfg, tp_rank=r, tp_size=4)
+        assert p.cols == ((4096 * r, 4096),)
+        p = tp.qwen35_plan(P + "3.self_attn.v_proj", H, 512, cfg, tp_rank=r, tp_size=4)
+        assert p.dst_offset == 4096 + 256
+    with pytest.raises(ValueError):          # an explicit False is honoured (q is then 32 heads, not 16384 wide)
+        tp.qwen35_plan(P + "3.self_attn.q_proj", H, 16384, dict(CFG, attn_output_gate=False), tp_rank=0, tp_size=4)
+
+
 @pytest.mark.parametrize("tp_size", [1, 2, 4])
 def test_expert_tp_plan(tp_size):
     """MoE TP narrowing (DESIGN 2.4 step 3): gate/up columns [r*I/tp, +I/tp), down rows the same."""
