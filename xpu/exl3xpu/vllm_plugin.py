@@ -27,6 +27,8 @@ Environment read by register():
                       patch set must never boot silently).
   EXL3_DRAFT_VOCAB    the pruned MTP draft head: refused (unvalidated on this model; a later MTP candidate).
   EXL3_CAPTURE_GUARD  'raise' or unset: the graph guard has only that mode (graph_guard.py).
+  EXL3_KV_STATS       '1': test-only, per full-attention layer and rank max|K|/max|V| of the raw
+                      K/V before the FP8 KV cache write, pass if every max < 112 (kv_stats.py).
 """
 from __future__ import annotations
 
@@ -492,6 +494,9 @@ def register():
     if guard != "raise":
         raise RuntimeError(f"exl3: EXL3_CAPTURE_GUARD={guard!r}: the graph guard has a single mode, 'raise'")
     graph_guard.install()
+    if os.environ.get("EXL3_KV_STATS", "0") == "1":
+        from . import kv_stats
+        kv_stats.install()
     if os.environ.get("EXL3_DRAFT_VOCAB"):
         raise RuntimeError("exl3: EXL3_DRAFT_VOCAB (pruned MTP draft head) is not supported by this plugin build: "
                            "unvalidated on this model and on a vocab-parallel lm_head")
