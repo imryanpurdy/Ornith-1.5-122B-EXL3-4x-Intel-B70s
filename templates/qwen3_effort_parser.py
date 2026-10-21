@@ -18,9 +18,11 @@ A non-streaming response would then return the answer as reasoning and content N
 work, because it checks the prompt for a closing </think> first.)
 
 What it changes. Only the thinking decision: thinking is off when enable_thinking is False (as before) or
-when reasoning_effort is a string that is "none", "off" or "minimal" after strip() and lower() -- the same
-test, on the same merged chat_template_kwargs, as the template. Everything else is Qwen3Parser unchanged
-(same grammar, same tool-call handling, same token ids).
+when reasoning_effort is a string that is "none", "off" or "minimal" after strip() and lower(), and on for
+every other input -- the same test, on the same merged chat_template_kwargs, as the template. Qwen3Parser
+gets that decision as a bool: on its own it treats any falsy enable_thinking (0, "") as off, while the
+template opens the think block for everything but False, so the reasoning would come back as content.
+Everything else is Qwen3Parser unchanged (same grammar, same tool-call handling, same token ids).
 """
 from vllm.parser.engine.adapters import make_adapters
 from vllm.parser.qwen3 import Qwen3Parser
@@ -41,9 +43,9 @@ def thinking_off(chat_template_kwargs) -> bool:
 
 class Qwen3EffortParser(Qwen3Parser):
     def __init__(self, tokenizer, tools=None, **kwargs):
-        ctk = kwargs.get("chat_template_kwargs") or {}
-        if thinking_off(ctk) and ctk.get("enable_thinking") is not False:
-            kwargs["chat_template_kwargs"] = {**ctk, "enable_thinking": False}
+        ctk = kwargs.get("chat_template_kwargs")
+        ctk = ctk if isinstance(ctk, dict) else {}
+        kwargs["chat_template_kwargs"] = {**ctk, "enable_thinking": not thinking_off(ctk)}
         super().__init__(tokenizer, tools, **kwargs)
 
 
