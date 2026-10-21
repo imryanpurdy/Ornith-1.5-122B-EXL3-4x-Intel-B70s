@@ -373,7 +373,9 @@ def qwen35_plan(module: str, k: int, n: int, cfg: dict, *, tp_rank: int, tp_size
             i = cfg["intermediate_size"]
             meta["output_sizes"] = [i, i]
     elif kind == "qkv":
-        meta.update(total_num_heads=cfg["num_attention_heads"] * (1 + int(bool(cfg.get("attn_output_gate", False)))),
+        # vLLM's Qwen3-Next/3.5 attention defaults attn_output_gate to True when the config omits it
+        # (qwen3_next.py, Qwen3NextAttention.__init__); use the same default so the plan matches its qkv_proj.
+        meta.update(total_num_heads=cfg["num_attention_heads"] * (1 + int(bool(cfg.get("attn_output_gate", True)))),
                     total_num_kv_heads=cfg["num_key_value_heads"], head_size=cfg["head_dim"])
     elif kind == "lmhead":
         a, b, per = vocab_shard(cfg["vocab_size"], tp_rank, tp_size)
