@@ -39,6 +39,26 @@ def _get_esimd():
                 _esimd.exl3_set_target_threads_mb16(int(os.environ["EXL3_TARGET_THREADS_MB16"]))
             if os.environ.get("EXL3_TARGET_THREADS_MB64") and hasattr(_esimd, "exl3_set_target_threads_mb64"):
                 _esimd.exl3_set_target_threads_mb64(int(os.environ["EXL3_TARGET_THREADS_MB64"]))
+            # split-K rule (exl3_ops.sycl plan_small): EXL3_SPLIT_ALPHA = narrow-N guard in percent (40; 0 = off),
+            # EXL3_SPLIT_WAVE = MB40-64 wave model (1; 0 = off). Both 0 = the old target-only rule.
+            if hasattr(_esimd, "exl3_set_split_rule") and (os.environ.get("EXL3_SPLIT_ALPHA") or os.environ.get("EXL3_SPLIT_WAVE")):
+                _esimd.exl3_set_split_rule(int(os.environ.get("EXL3_SPLIT_ALPHA", "-1")),
+                                           int(os.environ.get("EXL3_SPLIT_WAVE", "-1")))
+            # GEMV/DPAS cut-over. Default: per-K rule in the library (K=5: GEMV up to 8 rows on small shapes,
+            # within per-row-block shape limits; other K: GEMV up to 2 rows).
+            #   EXL3_VEC_MAX_M=n     one cut-over for every K and shape (old global knob; -1 = back to the rule)
+            #   EXL3_VEC_MAX_M_K=5:2,4:2   edit table entries (5:2 turns the K=5 small-shape GEMV route off)
+            #   EXL3_VEC_LIMIT=5:4:-1:12582912,5:8:256:-1   K:MR:kdim_max:kn_max shape limits (-1 = default)
+            if os.environ.get("EXL3_VEC_MAX_M_K") and hasattr(_esimd, "exl3_set_vec_max_m_k"):
+                for kv in os.environ["EXL3_VEC_MAX_M_K"].split(","):
+                    kk, vv = kv.split(":")
+                    _esimd.exl3_set_vec_max_m_k(int(kk), int(vv))
+            if os.environ.get("EXL3_VEC_LIMIT") and hasattr(_esimd, "exl3_set_vec_limit"):
+                for kv in os.environ["EXL3_VEC_LIMIT"].split(","):
+                    kk, mr, kd, kn = kv.split(":")
+                    _esimd.exl3_set_vec_limit(int(kk), int(mr), int(kd), int(kn))
+            if os.environ.get("EXL3_VEC_MAX_M"):
+                _esimd.exl3_set_vec_max_m(int(os.environ["EXL3_VEC_MAX_M"]))
             if INT8_PREFILL and hasattr(_esimd, "exl3_set_int8"):
                 _esimd.exl3_set_int8(1)          # fused W8A8 prefill inside the C++ linear
         except Exception as e:  # noqa
