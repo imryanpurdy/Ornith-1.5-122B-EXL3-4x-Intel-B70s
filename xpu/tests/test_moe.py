@@ -1,0 +1,212 @@
+"""
+X002: grouped EXL3 MoE (pointer-table experts) on XPU vs the trellis_core fp32 reference, on REAL Qwen3.8-Flash-Next
+routed experts; plus decode/prefill microbenchmarks with experts in device slots / host USM (zero-copy) / mixed.
+
+  python3 tests/test_moe.py --check            # correctness, layers 0 and 47, M = 1..16 (+ prefill sizes if built)
+  python3 tests/test_moe.py --bench-decode     # per-layer latency, device vs host-USM vs mixed
+"""
+import os, sys, json, time, argparse, random
+import torch
+import torch.nn.functional as F
+from safetensors import safe_open
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(HERE, "..", "..", "core", "src"))
+sys.path.insert(0, os.path.join(HERE, ".."))
+from trellis_core import reference as ref
+
+ap = argparse.ArgumentParser()
+ap.add_argument("--model", default=os.environ.get("MODEL", "/model"))
+ap.add_argument("--layer", type=int, default=0)
+ap.add_argument("--check", action="store_true")
+ap.add_argument("--check-m", default="1,2,3,4,8,16")
+ap.add_argument("--bench-decode", action="store_true")
+ap.add_argument("--bench-m", default="1,2,4,8,16")
+ap.add_argument("--bench-prefill", action="store_true")
+ap.add_argument("--prefill-m", default="2048,8192")
+ap.add_argument("--iters", type=int, default=100)
+ap.add_argument("--dtype", default="bf16")
+ap.add_argument("--out", default="")
+ap.add_argument("--splits", default="", help="gu_p,dn_p")
+ap.add_argument("--mr", type=int, default=0)
+ap.add_argument("--placements", default="device,host,mixed50,mixed20")
+args = ap.parse_args()
+
+torch.ops.load_library(os.environ.get("EXL3_MOE_LIB") or os.path.join(HERE, "..", "exl3xpu", "_moe.so"))
+X = torch.ops.exl3xpu_moe
+dev = torch.device("xpu:0")
+H, I, K, E, TOPK = 2560, 640, 3, 512, 10
+BLOB = X.blob_bytes(H, I, K)
+if args.splits:
+    X.moe_set_splits(*[int(v) for v in args.splits.split(",")])
+if args.mr:
+    X.moe_set_mr(args.mr)
+if os.environ.get("MOE_PREFILL_MIN_M"):
+    X.moe_set_prefill_min_m(int(os.environ["MOE_PREFILL_MIN_M"]))
+if os.environ.get("MOE_PAIR_MAX_M"):
+    X.moe_set_pair_max_m(int(os.environ["MOE_PAIR_MAX_M"]))
+if os.environ.get("MOE_DEBUG_SKIP"):
+    X.moe_set_debug(int(os.environ["MOE_DEBUG_SKIP"]))
+dt = torch.bfloat16 if args.dtype == "bf16" else torch.float16
+idx = json.load(open(f"{args.model}/model.safetensors.index.json"))["weight_map"]
+handles = {}
+
+
+def get(name):
+    fn = idx[name]
+    if fn not in handles:
+        handles[fn] = safe_open(f"{args.model}/{fn}", "pt", device="cpu")
+    return handles[fn].get_tensor(name)
+
+
+def expert_tensors(L, e):
+    p = f"model.language_model.layers.{L}.mlp.experts.{e}."
+    return {pr: {s: get(p + pr + "." + s) for s in ("trellis", "suh", "svh")} for pr in ("gate_proj", "up_proj", "down_proj")}
+
+
+def planar4(tr):
+    """int16 [rows, tiles, 16K] -> uint32 words, tiles grouped by 4, plane-major within the group (PLANAR4)."""
+    r, n, _ = tr.shape
+    D = K  # K=3: gcd(3,32)=1 -> D=3 words per period, 8 periods per tile
+    w = tr.contiguous().view(torch.int32).view(r, n // 4, 4, 8, D)       # [row, group, tile, period g, plane i]
+    return w.permute(0, 1, 4, 2, 3).contiguous()                         # [row, group, plane i, tile, g]
+
+
+def pack(t):
+    b = lambda z: z.contiguous().view(torch.uint8).flatten()
+    gu = torch.cat([t["gate_proj"]["trellis"], t["up_proj"]["trellis"]], dim=1)
+    blob = torch.cat([b(planar4(gu)), b(planar4(t["down_proj"]["trellis"])), b(t["gate_proj"]["suh"]), b(t["up_proj"]["suh"]),
+                      b(t["gate_proj"]["svh"]), b(t["up_proj"]["svh"]), b(t["down_proj"]["suh"]), b(t["down_proj"]["svh"])])
+    assert blob.numel() == BLOB, (blob.numel(), BLOB)
+    return blob
+
+
+def s64(p):
+    return p - (1 << 64) if p >= (1 << 63) else p
+
+
+def load_layer(L):
+    t0 = time.time()
+    host = X.host_alloc(E * BLOB).view(E, BLOB)          # USM host (zero-copy readable by the device)
+    for e in range(E):
+        host[e].copy_(pack(expert_tensors(L, e)))
+    devarena = host.to(dev)                               # device slots [E, BLOB]
+    print(f"layer {L}: packed {E} experts ({E * BLOB / 1e9:.3f} GB) in {time.time() - t0:.1f}s; "
+          f"usm_kind host={X.usm_kind(s64(host.data_ptr()))} dev={X.usm_kind(s64(devarena.data_ptr()))}", flush=True)
+    return host, devarena
+
+
+def ptr_table(host, devarena, on_host_mask):
+    hp = s64(host.data_ptr()) + torch.arange(E, dtype=torch.int64) * BLOB
+    dp = s64(devarena.data_ptr()) + torch.arange(E, dtype=torch.int64) * BLOB
+    return torch.where(on_host_mask, hp, dp).to(dev)
+
+
+def ref_moe(x, ids, w, L, cache):
+    """fp32 reference: dense original-basis weights (trellis_core.reference.weight_orig), grouped by expert."""
+    out = torch.zeros((x.shape[0], H), dtype=torch.float32, device=dev)
+    xf = x.float()
+    flat = ids.flatten().long()
+    for e in torch.unique(flat).tolist():
+        if e not in cache:
+            t = {pr: {s_: v.to(dev) for s_, v in d.items()} for pr, d in expert_tensors(L, e).items()}
+            cache[e] = {pr: ref.weight_orig(t[pr]["trellis"], t[pr]["suh"], t[pr]["svh"], K, 2) for pr in t}
+        W = cache[e]
+        pos = (flat == e).nonzero().flatten()
+        rows, ks = pos // ids.shape[1], pos % ids.shape[1]
+        xs = xf[rows.to(dev)]
+        a = F.silu(xs @ W["gate_proj"]) * (xs @ W["up_proj"])
+        d = a @ W["down_proj"]
+        out.index_add_(0, rows.to(dev), d * w[rows, ks].to(dev).unsqueeze(1))
+    return out
+
+
+def routing(M, g=None, skew=None):
+    g = g or torch.Generator().manual_seed(0)
+    logits = torch.randn((M, E), generator=g)
+    if skew is not None:
+        logits = logits + skew
+    w, ids = torch.topk(torch.softmax(logits, -1), TOPK, dim=-1)
+    w = w / w.sum(-1, keepdim=True)
+    return ids.to(torch.int32).to(dev), w.float().to(dev)
+
+
+res = {"check": [], "decode": [], "prefill": []}
+host, devarena = load_layer(args.layer)
+
+if args.check:
+    cache = {}
+    torch.manual_seed(0)
+    for M in [int(v) for v in args.check_m.split(",")]:
+        for placement in ("device", "host", "mixed"):
+            mask = {"device": torch.zeros(E, dtype=torch.bool), "host": torch.ones(E, dtype=torch.bool),
+                    "mixed": torch.arange(E) % 2 == 1}[placement]
+            ptrs = ptr_table(host, devarena, mask)
+            x = (torch.randn((M, H), device=dev) * 0.5).to(dt)
+            ids, w = routing(M, torch.Generator().manual_seed(M))
+            y = X.moe_forward(x, ids, w, ptrs, I, K, E)
+            y2 = X.moe_forward(x, ids, w, ptrs, I, K, E)
+            torch.xpu.synchronize()
+            r = ref_moe(x, ids.cpu(), w.cpu(), args.layer, cache)
+            err = ((y.float() - r).abs().max() / r.abs().max()).item()
+            rms = ((y.float() - r).pow(2).mean().sqrt() / r.pow(2).mean().sqrt()).item()
+            det = torch.equal(y, y2)
+            floor = ((r.to(dt).float() - r).pow(2).mean().sqrt() / r.pow(2).mean().sqrt()).item()
+            rec = {"M": M, "placement": placement, "max_rel": round(err, 5), "rms_rel": round(rms, 5),
+                   "rms_rel_floor_out_dtype": round(floor, 5), "deterministic": det}
+            res["check"].append(rec)
+            print(rec, flush=True)
+
+if args.bench_decode:
+    def bench(fn_list, iters):
+        for f in fn_list[:5]:
+            f()
+        torch.xpu.synchronize()
+        t = time.perf_counter()
+        for i in range(iters):
+            fn_list[i % len(fn_list)]()
+        torch.xpu.synchronize()
+        return (time.perf_counter() - t) / iters * 1e6
+
+    for M in [int(v) for v in args.bench_m.split(",")]:
+        x = (torch.randn((M, H), device=dev) * 0.5).to(dt)
+        routs = [routing(M, torch.Generator().manual_seed(1000 + i)) for i in range(64)]
+        for placement, frac in [(p, {"device": 0.0, "host": 1.0, "mixed50": 0.5, "mixed20": 0.2}[p])
+                                for p in args.placements.split(",")]:
+            mask = torch.rand(E, generator=torch.Generator().manual_seed(7)) < frac
+            ptrs = ptr_table(host, devarena, mask)
+            fns = [lambda ids=ids, w=w: X.moe_forward(x, ids, w, ptrs, I, K, E) for ids, w in routs]
+            us = bench(fns, args.iters)
+            n_unique = sum(len(torch.unique(ids)) for ids, _ in routs) / len(routs)
+            gb = n_unique * BLOB / 1e9
+            rec = {"M": M, "placement": placement, "us_per_layer": round(us, 1), "unique_experts": n_unique,
+                   "weight_GBps": round(gb / (us * 1e-6), 1), "ms_48_layers": round(us * 48 / 1e3, 2)}
+            res["decode"].append(rec)
+            print(rec, flush=True)
+
+if args.bench_prefill:
+    for M in [int(v) for v in args.prefill_m.split(",")]:
+        x = (torch.randn((M, H), device=dev) * 0.5).to(dt)
+        routs = [routing(M, torch.Generator().manual_seed(2000 + i)) for i in range(4)]
+        for placement in args.placements.split(","):
+            frac = {"device": 0.0, "host": 1.0, "mixed50": 0.5, "mixed20": 0.2}[placement]
+            mask = torch.rand(E, generator=torch.Generator().manual_seed(7)) < frac
+            ptrs = ptr_table(host, devarena, mask)
+            for ids, w in routs[:2]:
+                X.moe_forward(x, ids, w, ptrs, I, K, E)
+            torch.xpu.synchronize()
+            it = max(3, min(20, int(2e5 / M))) if placement == "device" else 3
+            t = time.perf_counter()
+            for i in range(it):
+                ids, w = routs[i % len(routs)]
+                X.moe_forward(x, ids, w, ptrs, I, K, E)
+            torch.xpu.synchronize()
+            ms = (time.perf_counter() - t) / it * 1e3
+            flops = M * TOPK * 3 * 2 * H * I
+            rec = {"M": M, "placement": placement, "ms_per_layer": round(ms, 3), "TFLOPS": round(flops / ms / 1e9, 1),
+                   "tok_per_s_48_layers_moe_only": round(M / (ms * 48 / 1e3), 0)}
+            res["prefill"].append(rec)
+            print(rec, flush=True)
+
+if args.out:
+    json.dump(res, open(args.out, "w"), indent=1)
