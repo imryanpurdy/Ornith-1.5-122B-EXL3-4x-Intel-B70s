@@ -1,4 +1,5 @@
 #include <map>
+#include <array>
 #include <cmath>
 // Host launchers + torch bindings for EXL3 ESIMD kernels.
 #include <torch/all.h>
@@ -179,8 +180,8 @@ static int dpas_nt(int MB) { return MB == 4 ? EXL3_DPAS4_NT : MB == 8 ? EXL3_DPA
 // Knobs: exl3_set_vec_max_m(n) with n >= 0 still forces one cut-over for every K (the old global knob);
 // n < 0 drops that override and returns to the per-K table. exl3_set_vec_max_m_k(K, n) edits one table entry
 // (n < 0 restores its default). GemvKernel has at most 8 rows (MR8), so any cut-over is capped at 8.
-static constexpr int kVecMaxMDefault[9] = {2, 2, 2, 2, 2, 8, 2, 2, 2};   // index = K
-static int g_vec_max_m_k[9] = {2, 2, 2, 2, 2, 8, 2, 2, 2};
+static constexpr std::array<int, 9> kVecMaxMDefault = {2, 2, 2, 2, 2, 8, 2, 2, 2};   // index = K
+static std::array<int, 9> g_vec_max_m_k = kVecMaxMDefault;
 static int g_vec_max_m = -1;  // global override for every K; -1 = use the per-K table
 static int vec_max_m_for(int K) {
     int v = g_vec_max_m >= 0 ? g_vec_max_m : ((K >= 0 && K <= 8) ? g_vec_max_m_k[K] : 2);
@@ -245,12 +246,19 @@ struct SmallPlan {
 //    MB40/48 use it only up to k = 4096 (tk <= 256): on the k=8192 o_proj/out_proj at M=40/48 (K=5/6) its one-wave
 //    pick (768 threads, 64 rows each) measured 4-7% slower than the old 2112-thread split (interleaved A/B), while
 //    the same pick at MB64 is 2-12% faster and every k <= 3072 shape (all of Ornith's TP4 slices) gains at MB40/48.
+//    Step 3 also needs units <= 1024, i.e. P = 1 fits in one wave. Above that (only the TP4 lm_head slice,
+//    3072 -> 62080 = 1940 units at MB64) the model's waves term ties P = 1 with P = 2, its b * P term then picks
+//    P = 1, and P = 1 measured 2-5% slower than the step-2 split at M = 56/64.
+// 4. Balance: P = ceil(tk / rps), then rps = ceil(tk / P), so all P splits are within one tile-row of each other
+//    (the grid rps of step 3 otherwise leaves a short last split, e.g. tk = 128: 6 x 24 rows -> 6 x 22 rows;
+//    4-5% faster on the cells where it differs). Steps 1 and 2 are already balanced on every Ornith shape.
+static constexpr int kResidentThreads256 = 1024;   // 256-GRF ESIMD threads resident on the B70 (32 Xe cores)
 static constexpr int kRpsGrid[] = {1, 2, 3, 4, 5, 6, 8, 10, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 512};
 static double wave_cost(int K, int units, int tk, int M, int N, int rps) {
     const double a = K == 4 ? 0.67 : (K == 5 ? 1.05 : (K == 6 ? 0.89 : 0.90));   // us per tile-row per wave (fit)
     int P = (tk + rps - 1) / rps;
     int r = (tk + P - 1) / P;
-    double waves = std::ceil((double)units * P / 1024.0);
+    double waves = std::ceil((double)units * P / (double)kResidentThreads256);
     return a * waves * r + P * (0.18 + 13e-6 * (double)M * (double)N);
 }
 static SmallPlan plan_small(int M, int K, int Kdim, int N) {
@@ -278,8 +286,8 @@ static SmallPlan plan_small(int M, int K, int Kdim, int N) {
         while (g < tk && 10000LL * g * g < a2tk) ++g;
         if (rps < g) { rps = g; p.rule = 1; }
     }
-    // 3. wave model for the 256-GRF DPAS blocks (MB40/48 only up to k = 4096, see above)
-    if (!p.vec && g_split_wave && (p.MB >= 64 || (p.MB >= 40 && tk <= 256))) {
+    // 3. wave model for the 256-GRF DPAS blocks (MB40/48 only up to k = 4096; P = 1 must fit one wave; see above)
+    if (!p.vec && g_split_wave && p.units <= kResidentThreads256 && (p.MB >= 64 || (p.MB >= 40 && tk <= 256))) {
         int best = -1;
         double bc = 0.0;
         for (int r : kRpsGrid) {
@@ -292,8 +300,10 @@ static SmallPlan plan_small(int M, int K, int Kdim, int N) {
         if (bc < 0.9 * wave_cost(K, p.units, tk, M, N, rps)) { rps = best; p.rule = 2; }
     }
     if (g_force_rps > 0) { rps = std::min(g_force_rps, tk); p.rule = 3; }
-    p.rps = rps;
     p.P = (tk + rps - 1) / rps;
+    // 4. balance the splits (forced rps is kept as given: sweeps pin it)
+    p.rps = p.rule == 3 ? rps : (tk + p.P - 1) / p.P;
+    p.P = (tk + p.rps - 1) / p.rps;
     return p;
 }
 
