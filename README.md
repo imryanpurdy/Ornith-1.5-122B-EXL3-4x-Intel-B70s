@@ -1,81 +1,64 @@
-# trellis-serve
+# Ornith-1.5-122B EXL3 on 4x Intel Arc Pro B70
 
-EXL3, the trellis quantization format from turboderp's [ExLlamaV3](https://github.com/turboderp-org/exllamav3), served
-by stock inference engines on GPUs that ExLlamaV3's own kernels don't cover well. Every kernel here decodes weights
-bit-for-bit the same as ExLlamaV3 (see [the lossless check](docs/lossless-check.md)).
+Serving recipe and engine plugin for **[Mia-AiLab/Ornith-1.5-122B-EXL3-EAQv1-4-bpw](https://huggingface.co/Mia-AiLab/Ornith-1.5-122B-EXL3-EAQv1-4-bpw)**
+(the 122B `qwen3_5_moe` model, EXL3 `mul1` codebook, 61.1 GiB) on **4x Intel Arc Pro B70 (32 GB, Xe2 / Battlemage)** with **vLLM**,
+using the published weights as they are: no re-quantizing, no llama.cpp.
 
-| Directory | Package | Engine | GPU | State |
-| --- | --- | --- | --- | --- |
-| [`core/`](core) | `trellis_core` | any | any | Checkpoint format reader and bit-exact PyTorch reference decoder |
-| [`cuda/`](cuda) | `sglang_exl3` | SGLang 0.5.20 (plugin, no source edits) | RTX 3090 (sm_86) | Validated recipes in local-ai-registry |
-| [`xpu/`](xpu) | `exl3xpu` | vLLM XPU 0.26, SGLang 0.5.20 XPU (plugins) | Intel Arc Pro B70 | vLLM validated; SGLang candidate |
+The EXL3 kernels and the vLLM plugin come from [trellis-serve](https://github.com/sybil-solutions/trellis-serve)
+(branch `ft-xpu_bmg`, MIT); this repository is a fork of it that adds what a 122B MoE across four cards needs.
+The upstream README is kept as [TRELLIS-SERVE-README.md](TRELLIS-SERVE-README.md); [ORIGIN.md](ORIGIN.md) records the exact source commit.
 
-Both plugins load EXL3 checkpoints as published on Hugging Face, for example
-[turboderp/Qwen3.8-27B-exl3](https://huggingface.co/turboderp/Qwen3.8-27B-exl3). Nothing is re-quantized.
+> **Status: work in progress, not servable yet.** See [Status](#status). `./start.sh` builds the kernels today and stops
+> before launching a server until the 4-card lane lands.
 
-## Quick start
-
-### RTX 3090 (SGLang)
-
-The accepted image is public:
+## Quick start (target shape)
 
 ```bash
-docker pull ghcr.io/0xsero/sglang-exl3:v0.7.0-ampere@sha256:c8922bd7256caf1b273af7ac49221e652be9e6072c1cdec4b959f506fd415d79
+git clone https://github.com/imryanpurdy/Ornith-1.5-122B-EXL3-4x-Intel-B70s.git && cd Ornith-1.5-122B-EXL3-4x-Intel-B70s
+cp .env.example .env    # MODEL_DIR, RUNTIME_IMAGE, TOOLCHAIN_IMAGE, BUILD_DIR, PORT, SERVED_MODEL_NAME, GPUS
+./start.sh
 ```
 
-The launch arguments that were tested are in the registry recipes:
-[Qwen3.8-27B](https://github.com/0xSero/local-ai-registry/blob/main/data/registry/recipe/qwen38-27b-exl3-3bpw-mtp-vision-rtx3090-sglang-tp1.json)
-and [Qwen3.6-35B-A3B](https://github.com/0xSero/local-ai-registry/blob/main/data/registry/recipe/qwen36-35b-a3b-exl3-3bpw-mtp-vision-rtx3090-sglang-tp1.json).
-To build from source, see [`cuda/README.md`](cuda/README.md).
+Requirements: 4x Arc Pro B70 on the `xe` kernel driver, Docker, ~62 GiB of disk for the weights, a vLLM 0.30 XPU image
+(torch 2.13.0+xpu) as the runtime, and `intel/omix:0.4.0-devel-ubuntu24.04` (oneAPI icpx 2026.1) to build the kernels.
+The kernel build runs on the CPU in throwaway containers; no GPU is needed for it.
 
-### Intel Arc Pro B70 (vLLM or SGLang)
+## How it works
 
-```bash
-IMG=ghcr.io/0xsero/exl3xpu@sha256:21412bdd7535e9c653eeb3d099dce3bc79a83d440def2cd9556111c79c870fa8
-```
+| Piece | Where | Notes |
+|---|---|---|
+| EXL3 dense kernels (GEMV, DPAS, reconstruct + GEMM) | `xpu/csrc/exl3_esimd.h`, `xpu/csrc/exl3_ops.sycl` | SYCL/ESIMD, JIT `spir64`; `mul1` at K=3..6; wide 5-bit DPAS build, per-shape GEMV/DPAS cut-over, shape-aware split-K |
+| EXL3 grouped MoE kernels | `xpu/csrc/exl3_moe.sycl` | upstream is K=3 only; Ornith's experts are K=4 (in progress) |
+| vLLM plugin | `xpu/exl3xpu/` | quantization config + linear method; MoE method and tensor parallelism in progress |
+| EXL3 tensor-parallel split rules | `core/src/trellis_core/format/geometry.py` | 128-aligned input/output splits, KV-head replication |
+| Kernel build | `scripts/build-kernels.sh` | builds `_C.so` and `_moe.so` against the runtime image's own torch |
 
-The run command, flags and GPU selection are in [`xpu/README.md`](xpu/README.md), and the tested recipe is
-[in the registry](https://github.com/0xSero/local-ai-registry/blob/main/data/registry/recipe/qwen38-27b-exl3-4bpw-arcb70-vllm-exl3xpu-tp1.json).
+Plan: attention and Gated DeltaNet layers split 4 ways (tensor parallel), the 256 routed experts split by whole experts
+(64 per card) or by width (1024 -> 256 per card), whichever measures faster; FP8 KV cache; XPU graphs for decode only
+(`FULL_DECODE_ONLY`; no graph is ever captured while serving).
+Every Ornith linear width is a multiple of 128, so every split is an exact slice of the EXL3 tensors.
 
-### Other GPUs
+## Status
 
-- Most NVIDIA cards: ExLlamaV3 itself, served by [TabbyAPI](https://github.com/theroyallab/tabbyAPI).
-- DGX Spark, RTX 5090, RTX PRO 6000: [b12x](https://github.com/local-inference-lab/b12x) by Local Inference Lab.
+| Milestone | State |
+|---|---|
+| 1. Kernels build for the runtime's torch; the checkpoint's EXL3 manifest checks out | done |
+| 1b. Dense kernels run correctly on a B70 against an independent reference | done |
+| 1c. Dense kernels faster for Ornith's shapes (5-bit DPAS, small-batch routing, split-K) | done |
+| 2. EXL3 MoE method in vLLM matches the reference on one card | in progress |
+| 3. Two cards match one card | planned |
+| 4. Ornith on four cards boots and answers | planned |
+| 5. Long-context recall, tool calls, throughput and a 60-minute soak | planned |
 
-## Measured
+Details: [docs/STATUS.md](docs/STATUS.md).
 
-One user, single request, from the recipes and package READMEs:
+## Acknowledgements
 
-| GPU | Model | Prose | Code |
-| --- | --- | --- | --- |
-| RTX 3090 | Qwen3.8-27B EXL3 3.0 bpw, MTP draft | 96.2 tok/s | 141.1 tok/s |
-| RTX 3090 | Qwen3.6-35B-A3B EXL3 3.0 bpw, MTP draft | 251.7 tok/s | 357.9 tok/s |
-| Arc Pro B70 | Qwen3.8-27B EXL3 4.0 bpw, MTP draft, thinking on | 91.2 tok/s | 66.1 tok/s |
+- [trellis-serve](https://github.com/sybil-solutions/trellis-serve) (MIT): the B70 EXL3 kernels, the vLLM and SGLang plugins and the split rules this builds on. Its `LICENSE` and `NOTICE` are kept unchanged.
+- [exllamav3](https://github.com/turboderp-org/exllamav3): the EXL3 format, the reference reconstruction and the tensor-parallel layouts.
+- [vLLM](https://github.com/vllm-project/vllm) and Intel's `vllm-xpu-kernels`, `llm-scaler` and oneAPI toolchain.
+- [Mia-AiLab](https://huggingface.co/Mia-AiLab) for the EXL3 quantization, and [ornith-ai](https://huggingface.co/ornith-ai) for the Ornith-1.5 models.
 
-On the B70 that is 3.6 times llama.cpp's Q4_K_M at one user and 6.5 times at sixteen (365.2 against 56.0 tok/s total).
+## License
 
-## Layout
-
-```
-core/    trellis_core: format reader (no torch) + reference decoder (torch); CPU tests
-cuda/    sglang_exl3: SGLang plugin, Marlin-style EXL3 kernels for sm_86 (cuda/csrc), dev Dockerfile, serve scripts
-xpu/     exl3xpu: vLLM and SGLang plugins, ESIMD kernels for Intel Xe2 (xpu/csrc), Dockerfile, tests, benchmarks
-docs/    the lossless check
-```
-
-Docker builds use the repository root as the build context, so both images get `core/`:
-
-```bash
-docker build -f cuda/docker/Dockerfile.dev -t sglang-exl3:dev .
-docker build -f xpu/docker/Dockerfile -t exl3xpu .
-```
-
-CPU tests: `cd core && python -m pytest`.
-
-## Credits
-
-The EXL3 format and its maths are turboderp's ([ExLlamaV3](https://github.com/turboderp-org/exllamav3), MIT). The CUDA
-kernel skeleton comes from vLLM's [Marlin](https://github.com/IST-DASLab/marlin) kernels (Apache-2.0). The trellis idea
-is from [QTIP](https://arxiv.org/abs/2406.11235). See [NOTICE](NOTICE).
-
-MIT licensed.
+MIT, inherited from trellis-serve; see [LICENSE](LICENSE) and [NOTICE](NOTICE).

@@ -7,3 +7,13 @@ build/
 logs/
 cuda/csrc/build.log
 xpu/bench/results.jsonl
+
+# recipe: local configuration and outputs
+.env
+dist/
+*.o
+*.log
+*.safetensors
+*.bin
+*.gguf
+*.pt
