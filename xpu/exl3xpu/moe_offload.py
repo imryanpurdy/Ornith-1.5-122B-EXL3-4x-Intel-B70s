@@ -78,6 +78,9 @@ def planar4(tr: torch.Tensor, K: int) -> torch.Tensor:
 
 def trellis_words(tr: torch.Tensor, K: int) -> torch.Tensor:
     """int16 trellis [rows, tiles, 16K] -> the int32 words the MoE kernels read for bit width K."""
+    if tr.dim() != 3 or tr.dtype != torch.int16 or tr.shape[-1] != 16 * K:
+        raise ValueError(f"pack_expert: trellis {tuple(tr.shape)} {tr.dtype} is not int16 [rows, tiles, {16 * K}] "
+                         f"(K={K})")
     if K in (3, 5, 7):
         return planar4(tr, K)
     if K == 4:   # D = 1: GemvKernel<4> is not planar (exl3_esimd.h PLANAR = D > 1); keep the checkpoint word order

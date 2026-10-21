@@ -103,6 +103,11 @@ def main():
         raise AssertionError("K=6 must be refused")
     except ValueError:
         print("PASS pack K=6 refused")
+    try:   # a K=5-wide trellis (80 int16 per tile) packed as K=4 would give a wrong-size blob
+        trellis_words(torch.zeros((8, 8, 80), dtype=torch.int16), 4)
+        raise AssertionError("trellis width 80 with K=4 must be refused")
+    except ValueError:
+        print("PASS pack trellis width != 16K refused")
     print("test_pack: all PASS" + ("" if lib is not None else " (blob_bytes not checked: no --moe-lib)"))
 
 
