@@ -67,8 +67,9 @@ mkdir -p "$STAGE/exl3xpu" "$STAGE/trellis_core/format" "$STAGE/exl3xpu-0.2.0.dev
 cp "$SRC"/xpu/exl3xpu/*.py "$STAGE/exl3xpu/"
 cp "$LIBS/_C.so" "$LIBS/_moe.so" "$STAGE/exl3xpu/"
 cp "$SRC"/core/src/trellis_core/__init__.py "$SRC"/core/src/trellis_core/reference.py "$STAGE/trellis_core/"
-cp "$SRC"/core/src/trellis_core/format/__init__.py "$SRC"/core/src/trellis_core/format/spec.py \
-   "$SRC"/core/src/trellis_core/format/geometry.py "$STAGE/trellis_core/format/"
+# the full format package: __init__ re-exports layout and manifest (which imports safetensors_header),
+# so the trimmed {__init__,spec,geometry} subset does not import; keep the package whole (pure Python, no torch)
+cp "$SRC"/core/src/trellis_core/format/*.py "$STAGE/trellis_core/format/"
 cat > "$STAGE/exl3xpu-0.2.0.dev0.dist-info/METADATA" <<EOF
 Metadata-Version: 2.1
 Name: exl3xpu
