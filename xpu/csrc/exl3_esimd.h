@@ -626,7 +626,8 @@ struct DpasKernel {
     static constexpr int RHS = PLANAR ? P : D * P;
     static constexpr int RPS = PLANAR ? G : 1;
 
-    // ---- Wide B build (default for K=5; K=6 opt-in with EXL3_WIDE6; EXL3_K5_NARROW restores build<u> for K=5).
+    // ---- Wide B build (default for K=5 at every MB and for K=6 at MB >= 16; EXL3_K5_NARROW / EXL3_K6_NARROW restore
+    // build<u>; EXL3_WIDE6 also takes K=6 MB8 wide, which measured 0.96-1.11x, i.e. no clear win, on the B70).
     // build<u> decodes one tile at a time with G lanes (K=5: G=8, i.e. 32 SIMD8 steps per tile), and its planar
     // de-interleave of the D-word periods costs per-element moves (stride D is not a legal register region).
     // Here one lane is one (tile, period) pair across TPG tiles: lane L = G*j + 8*b + a <-> tile j, period
@@ -635,14 +636,18 @@ struct DpasKernel {
     // covers G*TPG values (K=5: 32 lanes = 4 tiles). Same states, same decode, same VNNI positions as build<u>,
     // so the B operands are bit-identical.
 #ifdef EXL3_K5_NARROW
-    static constexpr bool WIDE = false;
+    static constexpr bool WIDE5 = false;
 #else
-    static constexpr bool WIDE = (K == 5 && V == 32 && CB == 2 && !FUSED)
-#ifdef EXL3_WIDE6
-        || (K == 6 && V == 16 && CB == 2 && !FUSED)
+    static constexpr bool WIDE5 = K == 5 && V == 32 && CB == 2 && !FUSED;
 #endif
-        ;
+#if defined(EXL3_K6_NARROW)
+    static constexpr bool WIDE6 = false;
+#elif defined(EXL3_WIDE6)
+    static constexpr bool WIDE6 = K == 6 && V == 16 && CB == 2 && !FUSED;
+#else
+    static constexpr bool WIDE6 = K == 6 && V == 16 && CB == 2 && !FUSED && MB >= 16;
 #endif
+    static constexpr bool WIDE = WIDE5 || WIDE6;
     static constexpr int NL = G * NT;      // lanes over the thread's NT tiles
     static constexpr int NPL = D + 1;      // plane 0: word D*grp - 1 (circular in the tile); plane 1 + i: word D*grp + i
 #ifndef EXL3_WIDE_TPG
