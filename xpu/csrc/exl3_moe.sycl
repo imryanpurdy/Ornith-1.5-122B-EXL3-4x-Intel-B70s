@@ -1065,7 +1065,7 @@ static void launch_ensure(sycl::queue& q, const int* ids, int npairs, int layer,
                 if (l == 0) fill_list[0] = 0;
                 return;
             }
-            for (int i = l; i < npairs; i += WG) need[ids[i]] = 1;
+            for (int i = l; i < npairs; i += WG) { int e = ids[i]; if (e >= 0) need[e] = 1; }   // -1: no expert
             sycl::group_barrier(g);
             const int T = sc[0];
             for (int e = l; e < E; e += WG) {
