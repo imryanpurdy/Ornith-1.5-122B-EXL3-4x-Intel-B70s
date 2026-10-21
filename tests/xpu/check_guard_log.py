@@ -1,17 +1,22 @@
 #!/usr/bin/env python3
 """Check a vLLM container log against the graph-guard gates (DESIGN rev 2, section 4.3). No torch, no vLLM.
 
-  capture-gate  every graph-mode run: N lines EXL3XPU_WARMUP_DONE (one per rank) with runner=XPUModelRunnerV2 and
-                captures == graphs == --expect-graphs; zero EXL3XPU_CAPTURE_AFTER_WARMUP, EXL3XPU_OPEN_CAPTURE*,
-                EXL3XPU_CAPTURE_COUNT_MISMATCH, EXL3XPU_GUARD_SELFTEST_FAILED, "XPU Graph is disabled" and
-                "XPU Graph is not supported" (vLLM forces cudagraph_mode NONE with those, platforms/xpu.py).
+  capture-gate  every graph-mode run: N lines EXL3XPU_WARMUP_DONE (one per rank) with runner=XPUModelRunnerV2,
+                captures == graphs == --expect-graphs and hooks= listing every --require-hooks entry (default all
+                five, G1,G2,G3a,G3b,G4, which a V2 XPU worker installs; a hook that never landed would otherwise pass
+                silently); the engine config line(s)
+                ("Initializing a V1 LLM engine ... 'cudagraph_mode': <CUDAGraphMode.X") show X == --cudagraph-mode;
+                zero EXL3XPU_CAPTURE_AFTER_WARMUP, EXL3XPU_OPEN_CAPTURE*, EXL3XPU_CAPTURE_COUNT_MISMATCH,
+                EXL3XPU_GUARD_SELFTEST_FAILED, "XPU Graph is disabled" and "XPU Graph is not supported" (vLLM forces
+                cudagraph_mode NONE with those, platforms/xpu.py).
   selftest      M2c guard self-test (EXL3_GUARD_SELFTEST=1, one card): after EXL3XPU_WARMUP_DONE, the log shows
                 EXL3XPU_GUARD_SELFTEST, then EXL3XPU_CAPTURE_AFTER_WARMUP, then EngineDeadError, within
                 --max-seconds; no EXL3XPU_GUARD_SELFTEST_FAILED; and the kernel log excerpt (journalctl -k --since
                 <launch>) has no xe reset line. The container exit and the clean relaunch are checked by the caller.
 
 Exit status 0 = PASS. Usage:
-  check_guard_log.py capture-gate --log run.log --ranks 4 --expect-graphs 8
+  check_guard_log.py capture-gate --log run.log --ranks 4 --expect-graphs 8 --cudagraph-mode FULL_DECODE_ONLY
+  check_guard_log.py capture-gate --log eager.log --ranks 1 --expect-graphs 0 --cudagraph-mode NONE
   check_guard_log.py selftest --log run.log --kernel-log kernel.log --max-seconds 60
 """
 from __future__ import annotations
@@ -23,6 +28,9 @@ from datetime import datetime
 
 TS = re.compile(r"\b(\d\d-\d\d \d\d:\d\d:\d\d)\b")
 WARM = re.compile(r"EXL3XPU_WARMUP_DONE rank=(\S+) runner=(\S+) captures=(\d+) graphs=(\d+)")
+HOOKS = re.compile(r"\bhooks=(\S+)")
+ENGINE_CFG = "Initializing a V1 LLM engine"
+CG_MODE = re.compile(r"'cudagraph_mode': <CUDAGraphMode\.([A-Z_]+)\b")
 BAD_ALWAYS = ("EXL3XPU_CAPTURE_AFTER_WARMUP", "EXL3XPU_OPEN_CAPTURE", "EXL3XPU_CAPTURE_COUNT_MISMATCH",
               "EXL3XPU_GUARD_SELFTEST_FAILED", "XPU Graph is disabled", "XPU Graph is not supported")
 XE_RESET = re.compile(r"\bxe\b.*\b(reset|wedged|GT\d*:? ?hang)\b", re.I)
@@ -33,20 +41,33 @@ def _ts(line: str):
     return datetime.strptime("2000-" + m.group(1), "%Y-%m-%d %H:%M:%S") if m else None
 
 
-def capture_gate(lines: list[str], ranks: int, expect_graphs: int, runner: str) -> list[str]:
+def capture_gate(lines: list[str], ranks: int, expect_graphs: int, runner: str, cudagraph_mode: str,
+                 require_hooks: tuple[str, ...] = ("G1", "G2", "G3a", "G3b", "G4")) -> list[str]:
     errs = []
-    warm = [WARM.search(l) for l in lines]
-    warm = [m for m in warm if m]
+    warm = [(WARM.search(l), l) for l in lines]
+    warm = [(m, l) for m, l in warm if m]
     if len(warm) != ranks:
         errs.append(f"{len(warm)} EXL3XPU_WARMUP_DONE lines, expected {ranks}")
-    for m in warm:
+    for m, line in warm:
         rank, rn, cap, gr = m.group(1), m.group(2), int(m.group(3)), int(m.group(4))
         if rn != runner:
             errs.append(f"rank {rank}: runner={rn}, expected {runner}")
         if not cap == gr == expect_graphs:
             errs.append(f"rank {rank}: captures={cap} graphs={gr}, expected {expect_graphs}")
-    if len({m.group(1) for m in warm}) != len(warm):
+        h = HOOKS.search(line[m.end():])
+        have = set(h.group(1).split(",")) if h else set()
+        missing = [k for k in require_hooks if k not in have]
+        if missing:
+            errs.append(f"rank {rank}: guard hooks not installed: {','.join(missing)} (hooks={h.group(1) if h else '?'})")
+    if len({m.group(1) for m, _ in warm}) != len(warm):
         errs.append("duplicate rank in EXL3XPU_WARMUP_DONE lines")
+    cfg = [l for l in lines if ENGINE_CFG in l]
+    modes = [CG_MODE.search(l) for l in cfg]
+    if not cfg or not all(modes):
+        errs.append(f"no engine config line with 'cudagraph_mode' ({len(cfg)} '{ENGINE_CFG}' lines)")
+    for mm in modes:
+        if mm and mm.group(1) != cudagraph_mode:
+            errs.append(f"engine config cudagraph_mode={mm.group(1)}, expected {cudagraph_mode}")
     for bad in BAD_ALWAYS:
         n = sum(bad in l for l in lines)
         if n:
@@ -94,6 +115,9 @@ def main(argv=None) -> int:
     a.add_argument("--ranks", type=int, required=True)
     a.add_argument("--expect-graphs", type=int, required=True)
     a.add_argument("--runner", default="XPUModelRunnerV2")
+    a.add_argument("--cudagraph-mode", required=True, help="resolved mode the engine config must show, e.g. "
+                   "FULL_DECODE_ONLY (graph runs) or NONE (eager runs)")
+    a.add_argument("--require-hooks", default="G1,G2,G3a,G3b,G4", help="guard hooks every rank must report installed")
     b = sub.add_parser("selftest")
     b.add_argument("--log", required=True)
     b.add_argument("--kernel-log", required=True)
@@ -102,7 +126,8 @@ def main(argv=None) -> int:
     with open(args.log, errors="replace") as f:
         lines = f.read().splitlines()
     if args.cmd == "capture-gate":
-        errs = capture_gate(lines, args.ranks, args.expect_graphs, args.runner)
+        errs = capture_gate(lines, args.ranks, args.expect_graphs, args.runner, args.cudagraph_mode,
+                            tuple(h for h in args.require_hooks.split(",") if h))
     else:
         with open(args.kernel_log, errors="replace") as f:
             kernel = f.read().splitlines()

@@ -358,11 +358,14 @@ def test_selftest_trips_g2_on_first_real_request(caplog, monkeypatch):
     assert r.execute_model(_sched(5)) == "out"                 # before SERVING: warmup traffic, no self-test
     assert r.execute_model(_sched(0), None, True) == "out"
     gg.SERVING = True
-    assert r.execute_model(_sched(0), None, True) == "out"     # dummy run while serving: no self-test
+    # dummy runs while serving carry scheduled tokens (_dummy_run sets total_num_scheduled_tokens = num_tokens and
+    # passes dummy_run as a keyword): the dummy flag alone must keep the self-test off, positional or keyword
+    assert r.execute_model(_sched(6), None, True) == "out"
+    assert r.execute_model(_sched(6), intermediate_tensors=None, dummy_run=True) == "out"
     assert r.execute_model(_sched(0)) == "out"                 # no scheduled tokens: no self-test
     with pytest.raises(gg.GraphGuardError, match="EXL3XPU_CAPTURE_AFTER_WARMUP"):
         r.execute_model(_sched(7))
-    assert glog == [] and len(rlog) == 4                      # nothing recorded, original not run
+    assert glog == [] and len(rlog) == 5                      # nothing recorded, original not run
     assert _lines(caplog, "EXL3XPU_GUARD_SELFTEST rank=") and _lines(caplog, "EXL3XPU_CAPTURE_AFTER_WARMUP")
     assert not _lines(caplog, "EXL3XPU_GUARD_SELFTEST_FAILED")
     assert r.execute_model(_sched(7)) == "out"                 # only once
