@@ -2,6 +2,9 @@
 Targeted fixes to vLLM internals that matter on XPU. Applied from the plugin entry point, each one
 checks the exact source it expects and logs + skips if vLLM changed (never patches blindly).
 
+On vLLM 0.30 only patch_fp8kv_prefill is applied (EXL3_VLLM_PATCHES=fp8kv, vllm_plugin.apply_patches); the
+others are kept for reference and refused by the plugin.
+
 gdn_mask_index: GDNAttentionMetadataBuilder.build indexes device tensors with a CPU boolean mask
   (e.g. block_table_tensor[spec_sequence_masks_cpu, :k]). That forces a pageable host->device copy of
   the mask, which on XPU's in-order queue waits for all prior GPU work: ~20 ms of stall every speculative
@@ -10,7 +13,6 @@ gdn_mask_index: GDNAttentionMetadataBuilder.build indexes device tensors with a 
   CPU-computed indices copied asynchronously from pinned memory + index_select (no sync).
 """
 from __future__ import annotations
-import copy
 import inspect
 import os
 import re
@@ -73,10 +75,72 @@ def patch_gdn_mask_index() -> bool:
 FP8KV_PREFILL_MIN_SEQ = 4096
 FP8KV_PREFILL_MIN_QUERY = 64      # genuine prefill chunks only (not MTP verify batches of k+1 tokens)
 
+# vLLM 0.30: source lines of the stock FlashAttentionImpl whose semantics the routed path relies on (cache layout,
+# fp8 view, metadata fields, scalar k/v scales). patch_fp8kv_prefill refuses to apply when one is missing, and the
+# plugin then aborts the boot (vllm_plugin.apply_patches).
+_FP8KV_FORWARD_MARKERS = (
+    "if attn_metadata is None:",
+    "key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)",
+    "key_cache = key_cache.view(current_platform.fp8_dtype())",
+    "value_cache = value_cache.view(current_platform.fp8_dtype())",
+    "if not attn_metadata.use_cascade:",
+    "cu_seqlens_q = attn_metadata.query_start_loc",
+    "seqused_k = attn_metadata.seq_lens",
+    "max_seqlen_k = attn_metadata.max_seq_len",
+    "block_table = attn_metadata.block_table",
+    "k_descale = layer._k_scale.expand(descale_shape)",
+    "v_descale = layer._v_scale.expand(descale_shape)",
+)
+_FP8KV_UPDATE_MARKERS = (
+    "key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)",
+    "reshape_and_cache_flash(",
+)
+_FP8KV_FORWARD_PARAMS = ("self", "layer", "query", "key", "value", "kv_cache", "attn_metadata", "output",
+                         "output_scale", "output_block_scale")
+_FP8KV_MD_FIELDS = ("num_actual_tokens", "max_query_len", "query_start_loc", "max_seq_len", "seq_lens",
+                    "block_table", "use_cascade", "causal", "mm_prefix_query_range_tensor", "rswa_prefix_lens")
+
+# routed prefill chunks in this process (tests and the first-use log line read it)
+FP8KV_STATS = {"routed": 0}
+
+
+def _fp8kv_source_problems(fa_mod) -> list[str]:
+    """What in the installed flash_attn backend differs from what the routed path was written against."""
+    cls = fa_mod.FlashAttentionImpl
+    problems = []
+    try:
+        fwd = inspect.getsource(cls.forward)
+        upd = inspect.getsource(cls.do_kv_cache_update)
+    except (OSError, TypeError, AttributeError) as e:
+        return [f"source not readable: {type(e).__name__}: {e}"]
+    problems += [f"forward lacks {m!r}" for m in _FP8KV_FORWARD_MARKERS if m not in fwd]
+    problems += [f"do_kv_cache_update lacks {m!r}" for m in _FP8KV_UPDATE_MARKERS if m not in upd]
+    params = tuple(inspect.signature(cls.forward).parameters)
+    if params != _FP8KV_FORWARD_PARAMS:
+        problems.append(f"forward parameters {params}")
+    md_fields = set(getattr(fa_mod.FlashAttentionMetadata, "__dataclass_fields__", {}))
+    problems += [f"FlashAttentionMetadata lacks {f}" for f in _FP8KV_MD_FIELDS if f not in md_fields]
+    for name in ("is_quantized_kv_cache", "current_platform", "AttentionType"):
+        if not hasattr(fa_mod, name):
+            problems.append(f"flash_attn module lacks {name}")
+    return problems
+
 
 def patch_fp8kv_prefill() -> bool:
-    """Route single-sequence prefill chunks over an fp8 KV cache through block-dequantized fp16 attention
-    (exl3xpu.fp8kv_prefill): the XPU FA2 kernel runs ~1.8x slower on fp8 K/V than on fp16."""
+    """Route single-sequence prefill chunks over an fp8 KV cache through 16-bit attention on the dequantized
+    sequence (exl3xpu.fp8kv_prefill.prefill_attention_paged): vllm_xpu_kernels' FA2 runs about 2x slower on fp8 K/V
+    than on bf16/fp16 at head_dim 256 (B70, vllm_xpu_kernels 0.1.14.1: 26-34 vs 56-75 TFLOPS, notes T15a).
+
+    Routed: one sequence in the batch, >= FP8KV_PREFILL_MIN_QUERY queries, >= FP8KV_PREFILL_MIN_SEQ keys, not
+    capturing a graph, a plain causal decoder layer (no ALiBi, sinks, soft cap, sliding window, DCP/PCP, cascade,
+    multimodal prefix ranges, R-SWA), fp16/bf16 queries. Everything else runs the stock kernel unchanged.
+    vLLM 0.30 port: the routed call is one paged causal FA call in the query's dtype over a gathered, dequantized
+    copy of the sequence, not trellis' KB-block merge (prefill_attention): the merge needs non-paged head_dim-256
+    kernels with LSE output that vllm_xpu_kernels 0.1.14.1 does not ship, so every merge part fell back to PyTorch
+    attention. No mixed decode+prefill route (0.30 fills num_decode_reqs / num_prefill_reqs only under DCP, and the
+    route needed a .item() sync), no oneDNN route; EXL3_FP8KV_MIXED=1 or EXL3_ONEDNN_ATTN=1 make it refuse.
+    EXL3_FP8KV_CHECK=1 (tests): each routed call syncs and checks that the sequence's real length is max_seq_len
+    (the V2 runner passes a CPU upper bound there, exact for a prefill chunk)."""
     try:
         from vllm.v1.attention.backends import flash_attn as fa_mod
     except Exception as e:  # noqa
@@ -85,134 +149,96 @@ def patch_fp8kv_prefill() -> bool:
     cls = getattr(fa_mod, "FlashAttentionImpl", None)
     if cls is None or getattr(cls, "_exl3_fp8kv_patched", False):
         return False
-    from .fp8kv_prefill import prefill_attention
+    if os.environ.get("EXL3_FP8KV_MIXED", "0") == "1":
+        logger.warning("exl3xpu: EXL3_FP8KV_MIXED=1 is not supported on vLLM 0.30; fp8-KV prefill patch not applied")
+        return False
+    from . import fp8kv_prefill
+    if fp8kv_prefill.ONEDNN_ATTN:
+        logger.warning("exl3xpu: EXL3_ONEDNN_ATTN=1 is not validated on vLLM 0.30; fp8-KV prefill patch not applied")
+        return False
+    problems = _fp8kv_source_problems(fa_mod)
+    if problems:
+        logger.warning("exl3xpu: FlashAttentionImpl differs from vLLM 0.30 (%s); fp8-KV prefill patch skipped",
+                       "; ".join(problems))
+        return False
     orig = cls.forward
     is_q = fa_mod.is_quantized_kv_cache
     fp8_dtype = fa_mod.current_platform.fp8_dtype()
     decoder = fa_mod.AttentionType.DECODER
+    check = os.environ.get("EXL3_FP8KV_CHECK", "0") == "1"
 
-    def eligible(self, md, output_scale, output_block_scale) -> bool:
+    def eligible(self, md, query, output_scale, output_block_scale) -> bool:
         if md is None or output_scale is not None or output_block_scale is not None:
             return False
-        if not is_q(self.kv_cache_dtype) or getattr(md, "use_cascade", False):
+        if not is_q(self.kv_cache_dtype) or md.use_cascade:
             return False
-        if md.max_query_len < FP8KV_PREFILL_MIN_QUERY or md.query_start_loc.shape[0] != 2 \
+        if md.query_start_loc.shape[0] != 2 or md.max_query_len < FP8KV_PREFILL_MIN_QUERY \
                 or md.max_seq_len < FP8KV_PREFILL_MIN_SEQ:
             return False
-        if torch.xpu.is_available() and torch.xpu.is_current_stream_capturing():
+        # one sequence: every token of the batch is its query, and its keys end at max_seq_len
+        if md.num_actual_tokens != md.max_query_len or md.max_seq_len < md.max_query_len:
             return False
-        if self.alibi_slopes is not None or getattr(self, "sinks", None) is not None:
-            return False
-        if self.logits_soft_cap not in (None, 0, 0.0) or getattr(self, "dcp_world_size", 1) != 1:
-            return False
-        if getattr(self, "attn_type", decoder) != decoder or not getattr(md, "causal", True):
-            return False
-        sw = getattr(md, "sliding_window", None) or self.sliding_window
-        if sw is not None and tuple(sw) != (-1, -1):
-            return False
-        if getattr(md, "mm_prefix_range_tensor", None) is not None or getattr(md, "rswa_prefix_lens", None) is not None:
-            return False
-        return True
-
-    def mixed_eligible(self, md, output_scale, output_block_scale) -> bool:
-        """decode requests + exactly one long prefill chunk (decodes are ordered first by vLLM)"""
-        if md is None or output_scale is not None or output_block_scale is not None:
-            return False
-        if os.environ.get("EXL3_FP8KV_MIXED", "0") != "1":
-            return False
-        if getattr(md, "num_prefill_reqs", 0) != 1 or getattr(md, "num_decode_reqs", 0) < 1:
-            return False
-        if md.num_actual_tokens - md.num_decode_tokens < FP8KV_PREFILL_MIN_QUERY or md.max_seq_len < FP8KV_PREFILL_MIN_SEQ:
-            return False
-        if not is_q(self.kv_cache_dtype) or getattr(md, "use_cascade", False):
+        if query.dtype not in (torch.float16, torch.bfloat16):
             return False
         if torch.xpu.is_available() and torch.xpu.is_current_stream_capturing():
             return False
         if self.alibi_slopes is not None or getattr(self, "sinks", None) is not None:
             return False
-        if self.logits_soft_cap not in (None, 0, 0.0) or getattr(self, "dcp_world_size", 1) != 1:
+        if self.logits_soft_cap not in (None, 0, 0.0):
             return False
-        if getattr(self, "attn_type", decoder) != decoder or not getattr(md, "causal", True):
+        if getattr(self, "dcp_world_size", 1) != 1 or getattr(self, "pcp_world_size", 1) != 1:
             return False
-        sw = getattr(md, "sliding_window", None) or self.sliding_window
+        if getattr(self, "attn_type", decoder) != decoder or getattr(self, "fa4_hd256", False):
+            return False
+        # 0.30: causal is a bool or a per-sequence Tensor; only the plain causal bool qualifies
+        if getattr(md, "causal", True) is not True:
+            return False
+        sw = self.sliding_window
         if sw is not None and tuple(sw) != (-1, -1):
             return False
-        if getattr(md, "mm_prefix_range_tensor", None) is not None or getattr(md, "rswa_prefix_lens", None) is not None:
+        # multimodal prefix ranges (0.30 name, and the older one) and R-SWA change the mask
+        if getattr(md, "mm_prefix_query_range_tensor", None) is not None \
+                or getattr(md, "mm_prefix_range_tensor", None) is not None \
+                or getattr(md, "rswa_prefix_lens", None) is not None:
             return False
         return True
-
-    def mixed_forward(self, layer, query, key, value, kv_cache, md, output):
-        """decode rows through the stock kernel on sliced metadata; the one long prefill chunk through the
-        block-dequantized fp16 path (a mixed step otherwise runs FA2 on fp8 K/V, ~1.8x slower, and every decode
-        stream waits for it: the multi-second stalls under interleaved load)"""
-        nd, ndt, n = md.num_decode_reqs, md.num_decode_tokens, md.num_actual_tokens
-        if not getattr(cls, "_exl3_mixed_logged", False):
-            cls._exl3_mixed_logged = True
-            logger.info("exl3xpu: mixed fp8-KV step: %d decode reqs (%d tokens) + prefill chunk of %d tokens",
-                        nd, ndt, n - ndt)
-        dmd = copy.copy(md)
-        dmd.num_actual_tokens = ndt
-        dmd.query_start_loc = md.query_start_loc[: nd + 1]
-        dmd.seq_lens = md.seq_lens[:nd]
-        dmd.block_table = md.block_table[:nd]
-        dmd.slot_mapping = md.slot_mapping[:ndt]
-        dmd.max_query_len = ndt
-        dmd.num_prefill_reqs, dmd.num_prefill_tokens = 0, 0
-        if getattr(dmd, "scheduler_metadata", None) is not None:
-            dmd.scheduler_metadata = None
-        orig(self, layer, query[:ndt], key[:ndt] if key is not None else None, value[:ndt] if value is not None else None,
-             kv_cache, dmd, output[:ndt])
-        key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
-        key_cache = key_cache.view(fp8_dtype)
-        value_cache = value_cache.view(fp8_dtype)
-        q = query[ndt:n]
-        if q.dtype not in (torch.float16, torch.bfloat16):
-            q = (q.float() * float(layer._q_scale)).to(torch.float16)
-        out = output[ndt:n].view(n - ndt, q.shape[1], self.head_size)
-        tmp = out if out.dtype == torch.float16 else torch.empty(out.shape, dtype=torch.float16, device=out.device)
-        ks = getattr(layer, "_k_scale_float", None)
-        vs = getattr(layer, "_v_scale_float", None)
-        ks = float(layer._k_scale) if ks is None else float(ks)
-        vs = float(layer._v_scale) if vs is None else float(vs)
-        seq_len = int(md.seq_lens[nd].item())
-        prefill_attention(q.to(torch.float16), key_cache, value_cache, md.block_table[nd], seq_len,
-                          ks, vs, float(self.scale), tmp)
-        if tmp is not out:
-            out.copy_(tmp)
-        return output
 
     def forward(self, layer, query, key, value, kv_cache, attn_metadata, output,
                 output_scale=None, output_block_scale=None):
         md = attn_metadata
-        if not eligible(self, md, output_scale, output_block_scale):
-            if mixed_eligible(self, md, output_scale, output_block_scale):
-                return mixed_forward(self, layer, query, key, value, kv_cache, md, output)
+        if not eligible(self, md, query, output_scale, output_block_scale):
             return orig(self, layer, query, key, value, kv_cache, attn_metadata, output,
                         output_scale, output_block_scale)
         n = md.num_actual_tokens
+        seq_len = int(md.max_seq_len)
+        if check:
+            real_len, real_q = int(md.seq_lens[0].item()), int(md.query_start_loc[1].item())
+            if real_len != seq_len or real_q != n:
+                raise RuntimeError(f"fp8kv prefill: max_seq_len {seq_len} / num_actual_tokens {n} differ from the "
+                                   f"sequence's seq_len {real_len} / query length {real_q}")
         key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
         key_cache = key_cache.view(fp8_dtype)
         value_cache = value_cache.view(fp8_dtype)
         q = query[:n]
-        if q.dtype not in (torch.float16, torch.bfloat16):
-            q = (q.float() * float(layer._q_scale)).to(torch.float16)
         out = output[:n].view(n, q.shape[1], self.head_size)
-        tmp = out if out.dtype == torch.float16 else torch.empty(out.shape, dtype=torch.float16, device=out.device)
         # host-side scale copies (no device sync); fall back to the tensors only if vLLM lacks them
         ks = getattr(layer, "_k_scale_float", None)
         vs = getattr(layer, "_v_scale_float", None)
         ks = float(layer._k_scale) if ks is None else float(ks)
         vs = float(layer._v_scale) if vs is None else float(vs)
-        prefill_attention(q.to(torch.float16), key_cache, value_cache, md.block_table[0], int(md.max_seq_len),
-                          ks, vs, float(self.scale), tmp)
-        if tmp is not out:
-            out.copy_(tmp)
+        fp8kv_prefill.prefill_attention_paged(q, key_cache, value_cache, md.block_table[0], seq_len,
+                                              ks, vs, float(self.scale), out)
+        FP8KV_STATS["routed"] += 1
+        if FP8KV_STATS["routed"] == 1:
+            logger.info("EXL3XPU_FP8KV_ROUTE first routed prefill chunk: %d queries over %d keys, %s compute, "
+                        "k_scale %g v_scale %g", n, seq_len, str(q.dtype).replace("torch.", ""), ks, vs)
         return output
 
     cls.forward = forward
     cls._exl3_fp8kv_patched = True
-    logger.info("exl3xpu: fp8-KV prefill attention routed through block-dequantized fp16 FA (>= %d tokens)",
-                FP8KV_PREFILL_MIN_SEQ)
+    cls._exl3_fp8kv_orig_forward = orig
+    logger.info("exl3xpu: fp8-KV prefill attention routed through dequantized 16-bit paged FA (one sequence, "
+                ">= %d queries, >= %d keys, outside graph capture)", FP8KV_PREFILL_MIN_QUERY, FP8KV_PREFILL_MIN_SEQ)
     return True
 
 
@@ -352,7 +378,6 @@ def patch_align_sync() -> bool:
 
 
 def apply_all():
-    patch_align_sync()
-    patch_gdn_mask_index()
-    patch_fp8kv_prefill()
-    patch_xpu_block_size()
+    """Not used on vLLM 0.30: the plugin applies only the patches EXL3_VLLM_PATCHES names, through
+    vllm_plugin.apply_patches (fp8kv only; the others are refused there)."""
+    raise RuntimeError("exl3xpu: vllm_patches.apply_all() is not supported on vLLM 0.30; use EXL3_VLLM_PATCHES")
