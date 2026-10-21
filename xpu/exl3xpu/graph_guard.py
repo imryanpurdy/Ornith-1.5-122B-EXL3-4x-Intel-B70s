@@ -149,7 +149,9 @@ def _graphs_of(mgr) -> int:
 
 def count_graphs(runner) -> tuple[int, dict[str, int]]:
     """Captured graphs held by the runner's, the speculator's and the encoder's graph managers, plus any
-    CUDAGraphWrapper / breakable-wrapper entries (V1, piecewise). Returns (total, per-source detail)."""
+    CUDAGraphWrapper entries (V1, piecewise). Returns (total, per-source detail). Breakable-wrapper captures
+    (one capture_begin per segment) are not counted here, so they show up as a captures/graphs mismatch; that
+    wrapper is only used for PIECEWISE without torch.compile, which the Ornith lane never runs."""
     detail: dict[str, int] = {}
     seen: set[int] = set()
 

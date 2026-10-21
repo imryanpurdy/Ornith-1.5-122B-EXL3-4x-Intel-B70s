@@ -37,6 +37,8 @@ to that file as JSON lines.
 - `test_graph_guard_xpu.py`: G2 and G1 on one real card (capture/replay during warmup, refusal while serving
   leaves no recording or stream behind, open-recording detection).
 - `check_guard_log.py capture-gate|selftest`: checks a container log against the capture gate (one
-  `EXL3XPU_WARMUP_DONE` per rank, `runner=XPUModelRunnerV2`, `captures == graphs == plan`, no guard trips) and the
+  `EXL3XPU_WARMUP_DONE` per rank, `runner=XPUModelRunnerV2`, `captures == graphs == plan`, all five guard hooks
+  installed on every rank, the engine config's resolved `cudagraph_mode` equal to `--cudagraph-mode`, no guard
+  trips; e.g. `capture-gate --log L --ranks 4 --expect-graphs 8 --cudagraph-mode FULL_DECODE_ONLY`) and the
   one-card guard self-test (`EXL3_GUARD_SELFTEST=1`: `EXL3XPU_CAPTURE_AFTER_WARMUP` then `EngineDeadError`
   within 60 s, no xe reset in the kernel log).
