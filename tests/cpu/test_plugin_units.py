@@ -253,3 +253,26 @@ def test_dump_skips_all_padding_batches(tmp_path, monkeypatch):
     assert sorted(p.name for p in tmp_path.iterdir()) == ["L0_r0_s0.pt"]
     d = torch.load(tmp_path / "L0_r0_s0.pt")
     assert torch.equal(d["topk_ids"], ids) and torch.equal(d["x"], x)
+
+
+# ---------------------------------------------------------------------------------------- EXL3_VLLM_PATCHES
+def test_patch_list_default_when_unset(monkeypatch):
+    """The lane leaves EXL3_VLLM_PATCHES unset on BF16 runs: unset must mean no patch (DESIGN 2.6 item 2)."""
+    monkeypatch.delenv("EXL3_VLLM_PATCHES", raising=False)
+    assert vllm_plugin._patch_list() == [] and vllm_plugin.apply_patches() == {}
+
+
+def test_requested_patch_not_applied_aborts(monkeypatch):
+    """A requested fp8kv that does not apply must fail register(), not serve the stock FP8 prefill path."""
+    import exl3xpu.vllm_patches as vp
+    monkeypatch.setenv("EXL3_VLLM_PATCHES", "fp8kv")
+    try:
+        from vllm.v1.attention.backends import flash_attn as fa
+        monkeypatch.setattr(fa.FlashAttentionImpl, "_exl3_fp8kv_patched", False, raising=False)
+    except Exception:          # noqa: BLE001  (backend not importable on this platform: apply_patches sees "not patched")
+        pass
+    monkeypatch.setattr(vp, "patch_fp8kv_prefill", lambda: False)
+    with pytest.raises(RuntimeError, match="did not apply"):
+        vllm_plugin.apply_patches()
+    monkeypatch.setattr(vp, "patch_fp8kv_prefill", lambda: True)
+    assert vllm_plugin.apply_patches() == {"fp8kv": "applied"}

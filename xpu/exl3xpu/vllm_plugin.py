@@ -22,7 +22,8 @@ reservation and the kernel variant warmup.
 Environment read by register():
   EXL3_VLLM_PATCHES   comma list of vllm_patches to apply; default empty. Only 'fp8kv' (patch_fp8kv_prefill) is
                       accepted on vLLM 0.30; 'align_sync', 'gdn_mask_index', 'xpu_block_size' (and the old '1' =
-                      all) are refused with a log line. '0' / 'none' = none.
+                      all) are refused with a log line. '0' / 'none' = none. A requested 'fp8kv' that does not
+                      apply aborts the process.
   EXL3_DRAFT_VOCAB    the pruned MTP draft head: refused (unvalidated on this model; a later MTP candidate).
   EXL3_CAPTURE_GUARD  'raise' or unset: the graph guard has only that mode (graph_guard.py).
 """
@@ -450,7 +451,8 @@ def _patch_list() -> list[str]:
 
 
 def apply_patches() -> dict[str, str]:
-    """EXL3_VLLM_PATCHES -> {name: applied | already | skipped | refused | unknown}."""
+    """EXL3_VLLM_PATCHES -> {name: applied | already | refused | unknown}; an accepted patch that does not apply
+    raises RuntimeError."""
     res: dict[str, str] = {}
     for name in _patch_list():
         if name in PATCHES_ACCEPTED:
@@ -466,7 +468,10 @@ def apply_patches() -> dict[str, str]:
             else:
                 res[name] = "applied" if vllm_patches.patch_fp8kv_prefill() else "skipped"
             if res[name] == "skipped":
+                # never serve a configuration other than the one requested (the lane asks for fp8kv on every
+                # FP8 run): fail the boot instead of falling back to the stock FP8 prefill path
                 logger.error("EXL3XPU_PATCH %s requested but not applied (see the vllm_patches log line above)", name)
+                raise RuntimeError(f"exl3: EXL3_VLLM_PATCHES requests {name!r} but the patch did not apply")
         elif name in PATCHES_REFUSED:
             res[name] = "refused"
             logger.warning("EXL3XPU_PATCH %s refused on vLLM 0.30 (only %s is accepted)", name,

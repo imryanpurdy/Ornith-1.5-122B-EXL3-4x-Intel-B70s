@@ -10,7 +10,7 @@ does in a fresh process for each relevant environment (register_probe.py):
   routed-expert loader: unexpected names, out-of-range ids, an expert after it was packed, a duplicate tensor,
       a bad marker; remote experts under EP are dropped and counted; process raises on missing local experts.
   EXL3XPU_LOADED: counts that differ from the checkpoint index raise (index with 4 extra local expert tensors).
-  register(): registers 'exl3' and installs the graph guard; EXL3_VLLM_PATCHES default empty, 'fp8kv' applies
+  register(): registers 'exl3' and installs the graph guard; EXL3_VLLM_PATCHES empty or unset = none, 'fp8kv' applies
       patch_fp8kv_prefill only, align_sync / gdn_mask_index / unknown names are refused or ignored with a log line;
       EXL3_DRAFT_VOCAB and EXL3_CAPTURE_GUARD != raise abort the process."""
 from __future__ import annotations
@@ -50,10 +50,10 @@ def test_refusal(units, name):
     assert units[name]["ok"], units[name]["detail"]
 
 
-def _probe(env: dict) -> dict:
+def _probe(env: dict, drop: tuple = ()) -> dict:
+    penv = {k: v for k, v in dict(os.environ, PYTHONDONTWRITEBYTECODE="1", **env).items() if k not in drop}
     p = subprocess.run([sys.executable, str(Path(__file__).with_name("register_probe.py")), "--xpu-platform"],
-                       env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1", **env), stdout=subprocess.PIPE,
-                       stderr=subprocess.STDOUT, text=True, timeout=600)
+                       env=penv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=600)
     lines = [ln for ln in p.stdout.splitlines() if ln.startswith("REGISTER_PROBE ")]
     assert lines, p.stdout[-4000:]
     res = json.loads(lines[-1][len("REGISTER_PROBE "):])
@@ -67,6 +67,13 @@ def test_register_default():
     assert r["guard"]["G2"] and r["guard"]["G3a"] and r["guard"]["G3b"], r["guard"]     # G1/G4 apply on import
     assert "EXL3XPU_GRAPH_GUARD installed=" in r["log"] and "EXL3XPU_PLUGIN registered quantization=exl3" in r["log"]
     assert r["log"].index("EXL3XPU_GRAPH_GUARD") < r["log"].index("EXL3XPU_PLUGIN registered")
+
+
+def test_register_default_unset():
+    """The lane's BF16 runs leave EXL3_VLLM_PATCHES unset: no patch may apply."""
+    r = _probe({}, drop=("EXL3_VLLM_PATCHES",))
+    assert r["ok"] and r["registered"] and r["patches"] == {} and r["fp8kv_patched"] is False, r
+    assert "patches=-" in r["log"], r["log"][-3000:]
 
 
 def test_register_fp8kv_only():
