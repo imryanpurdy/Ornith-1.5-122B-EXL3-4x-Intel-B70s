@@ -5,11 +5,14 @@ grouped MoE kernels (`torch.ops.exl3xpu_moe.moe_forward`, csrc/exl3_moe.sycl) ad
 per-layer POINTER TABLE, so moving an expert between tiers is a single 8-byte table write; both pointers are always
 valid, so a table update never races a kernel into reading garbage.
 
-Expert blob (one per expert, `blob_bytes(H, I, K)` bytes, 1,862,400 B for H=2560, I=640, K=3):
-  gate|up trellis (u32, [H/16][2I/16][8K], PLANAR4 word order) | down trellis ([I/16][H/16][8K], PLANAR4) |
+Expert blob (one per expert, `blob_bytes(H, I, K)` bytes, 1,862,400 B for H=2560, I=640, K=3; 4,743,168 B for
+H=3072, I=1024, K=4):
+  gate|up trellis (u32, [H/16][2I/16][8K]) | down trellis ([I/16][H/16][8K]) |
   suh_g[H] suh_u[H] svh_g[I] svh_u[I] suh_d[I] svh_d[H]   (fp16)
-PLANAR4: in every k-row the tiles are grouped by 4 along n; a group's 4*8K words are stored plane-major
-([plane i][tile][period g]) instead of tile-major ([tile][3g + i]) -- see pack_expert().
+Trellis word order (see trellis_words()):
+  K = 3, 5, 7 (D = K words per 32-value period): PLANAR4. In every k-row the tiles are grouped by 4 along n; a
+    group's 4*8K words are stored plane-major ([plane i][tile][period g]) instead of tile-major ([tile][K*g + i]).
+  K = 4 (D = 1): checkpoint order, the int16 trellis viewed as int32 words (what the dense kernels read too).
 
 API (all device work is enqueued on the current XPU stream unless noted; nothing syncs the host):
   store = ExpertStore(H, I, K, n_experts, n_slots)          # n_slots device slots shared by all layers
@@ -73,11 +76,20 @@ def planar4(tr: torch.Tensor, K: int) -> torch.Tensor:
     return w.permute(0, 1, 4, 2, 3).contiguous()                         # [row, group, plane i, tile, g]
 
 
+def trellis_words(tr: torch.Tensor, K: int) -> torch.Tensor:
+    """int16 trellis [rows, tiles, 16K] -> the int32 words the MoE kernels read for bit width K."""
+    if K in (3, 5, 7):
+        return planar4(tr, K)
+    if K == 4:   # D = 1: GemvKernel<4> is not planar (exl3_esimd.h PLANAR = D > 1); keep the checkpoint word order
+        return tr.contiguous().view(torch.int32)
+    raise ValueError(f"pack_expert: no MoE word order for K={K} (K = 3, 4, 5, 7)")
+
+
 def pack_expert(gate: dict, up: dict, down: dict, K: int, out: torch.Tensor | None = None) -> torch.Tensor:
     """Checkpoint tensors {trellis, suh, svh} of one expert -> blob (uint8 CPU tensor, or written into `out`)."""
     b = lambda z: z.contiguous().view(torch.uint8).flatten()     # noqa: E731
     gu = torch.cat([gate["trellis"], up["trellis"]], dim=1)
-    parts = [b(planar4(gu, K)), b(planar4(down["trellis"], K)), b(gate["suh"].half()), b(up["suh"].half()),
+    parts = [b(trellis_words(gu, K)), b(trellis_words(down["trellis"], K)), b(gate["suh"].half()), b(up["suh"].half()),
              b(gate["svh"].half()), b(up["svh"].half()), b(down["suh"].half()), b(down["svh"].half())]
     if out is None:
         return torch.cat(parts)
