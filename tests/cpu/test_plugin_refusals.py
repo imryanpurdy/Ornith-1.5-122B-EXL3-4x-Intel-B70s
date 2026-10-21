@@ -5,10 +5,12 @@ does in a fresh process for each relevant environment (register_probe.py):
       EXL3 embedding raises; a fused module with mixed or partly missing storage raises; routed experts that are
       not all EXL3 with one K raise; in_proj_ba and visual.* get UnquantizedLinearMethod.
   dense loaders: tuple shard ids other than (0, 1, 2), a matrix delivered under the wrong shard id, a codebook
-      marker that is not mul1, a trellis of another K; process_weights_after_loading raises on a missing shard,
-      a component loaded twice, a missing codebook marker, a K the kernels lack (no silent Triton fallback).
+      marker that is not mul1, a trellis of another K, non-fp16 suh / svh; process_weights_after_loading raises on
+      a missing shard, a component loaded twice, a missing codebook marker, a K the kernels lack (no silent Triton
+      fallback).
   routed-expert loader: unexpected names, out-of-range ids, an expert after it was packed, a duplicate tensor,
-      a bad marker; remote experts under EP are dropped and counted; process raises on missing local experts.
+      a bad marker, a non-fp16 scale; remote experts under EP are dropped and counted; process raises on missing
+      local experts.
   EXL3XPU_LOADED: counts that differ from the checkpoint index raise (index with 4 extra local expert tensors).
   register(): registers 'exl3' and installs the graph guard; EXL3_VLLM_PATCHES empty or unset = none, 'fp8kv' applies
       patch_fp8kv_prefill only, align_sync / gdn_mask_index / unknown names are refused or ignored with a log line;
@@ -36,6 +38,7 @@ UNITS = {
     "process_unsupported_K_refuses_fallback", "moe_unexpected_name_refused", "moe_expert_out_of_range_refused",
     "moe_remote_expert_dropped", "moe_local_expert_packed", "moe_after_complete_refused", "moe_duplicate_refused",
     "moe_bad_marker_refused", "moe_process_missing_raises", "loaded_count_mismatch_raises",
+    "loader_non_fp16_scale_refused", "moe_non_fp16_scale_refused",
 }
 
 

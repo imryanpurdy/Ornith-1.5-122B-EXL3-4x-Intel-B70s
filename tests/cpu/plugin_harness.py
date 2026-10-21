@@ -629,6 +629,11 @@ def cmd_units(model: str, cases: list[dict]) -> list[dict]:
     lay = layer_qkvz()
     k4 = dict(qkv, trellis=qkv["trellis"][..., :64].contiguous())
     check("loader_wrong_K_refused", _expect_raise(lambda: feed(lay, k4, (0, 1, 2), only=["trellis"]), "not K=5"))
+    lay = layer_qkvz()
+    f32 = dict(qkv, suh=qkv["suh"].float(), svh=qkv["svh"].float())
+    r1 = _expect_raise(lambda: feed(lay, f32, (0, 1, 2), only=["suh"]), "suh dtype")
+    r2 = _expect_raise(lambda: feed(lay, f32, (0, 1, 2), only=["svh"]), "svh dtype")
+    check("loader_non_fp16_scale_refused", (r1[0] and r2[0], f"{r1[1]} | {r2[1]}"))
     def complete():
         lay = layer_qkvz()
         feed(lay, qkv, (0, 1, 2))
@@ -698,6 +703,8 @@ def cmd_units(model: str, cases: list[dict]) -> list[dict]:
     check("moe_duplicate_refused", _expect_raise(lambda: run(expert(201)[:1] + expert(201)[:1]), "loaded twice"))
     bad = [(n, torch.tensor(-1, dtype=torch.int32) if n.endswith("mul1") else t) for n, t in expert(202)]
     check("moe_bad_marker_refused", _expect_raise(lambda: run(bad), "not mul1"))
+    bad = [(n, t.float() if n.endswith(".svh") else t) for n, t in expert(203)]
+    check("moe_non_fp16_scale_refused", _expect_raise(lambda: run(bad), "expected a float16 vector"))
     check("moe_process_missing_raises", _expect_raise(
         lambda: moe.quant_method.process_weights_after_loading(moe), "of 128 local experts loaded"))
     del target, moe

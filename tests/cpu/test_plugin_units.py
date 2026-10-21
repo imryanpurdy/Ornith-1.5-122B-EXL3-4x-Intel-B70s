@@ -1,6 +1,9 @@
 """Plugin pieces that need neither a checkpoint nor a vLLM model: the MoE id mapping and row chunking of
 moe_vllm (fake layers, a recording kernel), blob sizes, module-name normalisation and storage lookup, the
-EXL3_VLLM_PATCHES parser, and loadcheck's batch bookkeeping (when a batch closes, what it refuses)."""
+EXL3_VLLM_PATCHES parser, and loadcheck's batch bookkeeping (when a batch closes, what it refuses). Also the branches
+the model-level tests cannot reach on a CPU: Exl3MoEMethod.create_weights refusals and process_weights_after_loading
+checks on a stand-in RoutedExperts, the variant-warmup launch list and the device-only steps of a batch close (with a
+stand-in for the MoE host ops), routing refusals on bare layer instances, and the eager dump."""
 from __future__ import annotations
 
 import types
@@ -276,3 +279,239 @@ def test_requested_patch_not_applied_aborts(monkeypatch):
         vllm_plugin.apply_patches()
     monkeypatch.setattr(vp, "patch_fp8kv_prefill", lambda: True)
     assert vllm_plugin.apply_patches() == {"fp8kv": "applied"}
+
+
+# ---------------------------------------------------------- branches the model-level CPU tests cannot reach
+def test_routing_refusals_on_layer_types():
+    """get_quant_method on bare instances of vLLM's layer classes (isinstance is all it looks at)."""
+    from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+    from vllm.model_executor.layers.linear import ColumnParallelLinear, UnquantizedLinearMethod
+    from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+    c = _cfg({"layers.0.self_attn.q_proj": 5, "layers.0.self_attn.k_proj": 5, "layers.0.self_attn.v_proj": 5})
+    head, lin, rexp = (object.__new__(cls) for cls in (ParallelLMHead, ColumnParallelLinear, RoutedExperts))
+    with pytest.raises(ValueError, match="no EXL3 matrices"):
+        c.get_quant_method(head, "mtp.lm_head")                       # an lm_head without EXL3 storage
+    with pytest.raises(ValueError, match="lm_head in the vision tower"):
+        c.get_quant_method(head, "visual.head")
+    with pytest.raises(ValueError, match="MoE layer in the vision tower"):
+        c.get_quant_method(rexp, "visual.blocks.0.mlp.experts")
+    assert isinstance(c.get_quant_method(lin, "language_model.model.layers.0.linear_attn.in_proj_ba"),
+                      UnquantizedLinearMethod)
+    assert isinstance(c.get_quant_method(lin, "visual.blocks.0.mlp.linear_fc1"), UnquantizedLinearMethod)
+    with pytest.raises(ValueError, match="no EXL3 matrices"):
+        c.get_quant_method(lin, "language_model.model.layers.0.mlp.foo_proj")
+    assert isinstance(c.get_quant_method(lin, "language_model.model.layers.0.self_attn.qkv_proj"),
+                      vllm_plugin.Exl3LinearMethod)
+
+
+# Exl3MoEMethod on a stand-in RoutedExperts (create_weights validation, process_weights_after_loading)
+from vllm.model_executor.layers.fused_moe.activation import MoEActivation  # noqa: E402
+
+_H, _I, _E = 256, 256, 4
+
+
+class _FakeRoutedExperts(torch.nn.Module):
+    def __init__(self, E=_E, H=_H, I=_I):
+        super().__init__()
+        pc = types.SimpleNamespace(dp_size=1, pcp_size=1, use_all2all_kernels=False, is_sequence_parallel=False,
+                                   enable_eplb=False, tp_size=1, tp_rank=0, use_ep=False, ep_size=1, ep_rank=0)
+        self.moe_config = types.SimpleNamespace(moe_parallel_config=pc, is_act_and_mul=True,
+                                                activation=MoEActivation.SILU, has_bias=False, hidden_dim=H,
+                                                intermediate_size=I, experts_per_token=2)
+        self.apply_router_weight_on_input = False
+        self.routed_scaling_factor = 1.0
+        self.expert_map_manager = types.SimpleNamespace(num_fused_shared_experts=0)
+        self.local_num_experts = self.global_num_experts = E
+        self.layer_name = "language_model.model.layers.0.mlp.experts"
+
+
+def _moe_method(layer):
+    return moe_vllm.Exl3MoEMethod(_cfg({}), layer.moe_config, layer.layer_name, 4)
+
+
+def _create(layer, **over):
+    kw = dict(num_experts=_E, hidden_size=_H, intermediate_size_per_partition=_I, params_dtype=torch.bfloat16)
+    kw.update(over)
+    meth = _moe_method(layer)
+    meth.create_weights(layer, **kw)
+    return meth
+
+
+def _set(path, value):
+    """Mutator: set the attribute at a dotted path below the layer."""
+    def f(layer):
+        *head, last = path.split(".")
+        tgt = layer
+        for p in head:
+            tgt = getattr(tgt, p)
+        setattr(tgt, last, value)
+    return f
+
+
+_BAD_MOE = {
+    "gelu": (_set("moe_config.activation", MoEActivation.GELU), {}, "activation"),
+    "not_gated": (_set("moe_config.is_act_and_mul", False), {}, "activation"),
+    "router_weight_on_input": (_set("apply_router_weight_on_input", True), {}, "apply_router_weight_on_input"),
+    "routed_scaling": (_set("routed_scaling_factor", 2.5), {}, "routed_scaling_factor 2.5"),
+    "bias": (_set("moe_config.has_bias", True), {}, "expert bias"),
+    "fused_shared": (_set("expert_map_manager.num_fused_shared_experts", 1), {}, "fused shared experts"),
+    "dp": (_set("moe_config.moe_parallel_config.dp_size", 2), {}, "dp 2"),
+    "pcp": (_set("moe_config.moe_parallel_config.pcp_size", 2), {}, "pcp 2"),
+    "all2all": (_set("moe_config.moe_parallel_config.use_all2all_kernels", True), {}, "all2all True"),
+    "seq_parallel": (_set("moe_config.moe_parallel_config.is_sequence_parallel", True), {}, "sequence parallel True"),
+    "eplb": (_set("moe_config.moe_parallel_config.enable_eplb", True), {}, "EPLB"),
+    "hidden_not_128": (_set("moe_config.hidden_dim", 200), {"hidden_size": 200}, "multiples of 128"),
+    "hidden_mismatch": (_set("moe_config.hidden_dim", 512), {}, "sizes: hidden 256 vs 512"),
+    "local_experts_mismatch": (lambda l: None, {"num_experts": 3}, "local experts 3 vs 4"),
+    "intermediate_mismatch": (lambda l: None, {"intermediate_size_per_partition": 128}, "intermediate 256"),
+    "fp32_activations": (lambda l: None, {"params_dtype": torch.float32}, "activation dtype"),
+}
+
+
+@pytest.mark.parametrize("case", sorted(_BAD_MOE))
+def test_moe_create_weights_refusals(lc, case):
+    mutate, over, needle = _BAD_MOE[case]
+    layer = _FakeRoutedExperts()
+    mutate(layer)
+    with pytest.raises(NotImplementedError, match="unsupported MoE configuration") as ei:
+        _create(layer, **over)
+    assert needle in str(ei.value), str(ei.value)
+    assert not hasattr(layer, "exl3_arena")
+
+
+class _FakeMoeOps:
+    """moe_offload.ops() stand-in: blob_bytes / moe_info / moe_plan / overrides / moe_forward, recording calls."""
+
+    def __init__(self, blob=None, miss_from=None):
+        self.blob, self.miss_from, self.calls = blob, miss_from, []
+
+    def blob_bytes(self, H, I, K):
+        return moe_vllm.blob_bytes(H, I, K) if self.blob is None else self.blob
+
+    def moe_info(self, dev):
+        self.calls.append(("info", dev))
+        return [4, 0]
+
+    def moe_set_mr(self, v):
+        self.calls.append(("mr", v))
+
+    def moe_set_splits(self, a, b):
+        self.calls.append(("splits", a, b))
+
+    def moe_plan(self, H, I, K, M):
+        self.calls.append(("plan", M))
+        if self.miss_from is not None and M >= self.miss_from:
+            return [0, 0, 0, 0]
+        return [1, 12, 8, 8] if M <= 4 else ([2, 6, 8, 8] if M <= 64 else [4, 6, 8, 8])
+
+    def moe_forward(self, x, ids, w, ptrs, I, K, E):
+        self.calls.append(("forward", x.shape[0], ids.dtype, tuple(ids.shape), int(ids.min()), int(ids.max()),
+                           w.dtype, I, K, E))
+        return torch.zeros_like(x)
+
+
+@pytest.fixture
+def fake_moe_ops(monkeypatch):
+    from exl3xpu import moe_offload
+    holder = {"ops": _FakeMoeOps()}
+    monkeypatch.setattr(moe_offload, "ops", lambda: holder["ops"])
+    return holder
+
+
+def _loaded_layer():
+    layer = _FakeRoutedExperts()
+    meth = _create(layer)
+    layer.exl3_packed = [True] * _E            # as if every local expert had been packed by the loader
+    return layer, meth
+
+
+def test_moe_process_weights_success(lc, fake_moe_ops):
+    layer, meth = _loaded_layer()
+    assert layer.exl3_arena.shape == (_E, moe_vllm.blob_bytes(_H, _I, 4)) and hasattr(layer, "w13_trellis")
+    meth.process_weights_after_loading(layer)
+    X = fake_moe_ops["ops"]
+    want = layer.exl3_arena.data_ptr() + torch.arange(_E, dtype=torch.int64) * layer.exl3_blob
+    assert torch.equal(layer.exl3_ptrs, want) and layer.exl3_emap is None
+    assert layer.exl3_kernel == X.moe_forward
+    assert not any(hasattr(layer, f"{w}_{p}") for w in ("w13", "w2") for p in moe_vllm.PARTS)
+    kinds = [c[0] for c in X.calls]
+    assert kinds[0] == "info" and kinds.index("info") < kinds.index("plan")          # moe_info before any plan
+    assert ("mr", 0) in X.calls[:kinds.index("plan")] and ("splits", 0, 0) in X.calls[:kinds.index("plan")]
+    assert sorted(m for c in X.calls if c[0] == "plan" for m in [c[1]]) == list(range(1, 1025))
+    assert layer.exl3_plans == {(1, 12, 8, 8): 1, (2, 6, 8, 8): 5, (4, 6, 8, 8): 65}
+    assert [c["role"] for c in lc.CLOSED] == ["target"] and "experts=0" in lc.CLOSED[0]["line"]
+
+
+def test_moe_process_weights_planner_miss_raises(lc, fake_moe_ops):
+    layer, meth = _loaded_layer()
+    fake_moe_ops["ops"] = _FakeMoeOps(miss_from=600)
+    with pytest.raises(ValueError, match=r"no MoE kernel for \(H=256, I=256, K=4\) from M=600"):
+        meth.process_weights_after_loading(layer)
+
+
+def test_moe_process_weights_blob_mismatch_raises(lc, fake_moe_ops):
+    layer, meth = _loaded_layer()
+    fake_moe_ops["ops"] = _FakeMoeOps(blob=moe_vllm.blob_bytes(_H, _I, 4) + 64)
+    with pytest.raises(ValueError, match="blob layout mismatch"):
+        meth.process_weights_after_loading(layer)
+
+
+def test_moe_process_weights_missing_expert_raises(lc, fake_moe_ops):
+    layer, meth = _loaded_layer()
+    layer.exl3_packed[2] = False
+    with pytest.raises(ValueError, match=r"3 of 4 local experts loaded; missing local slots \[2\]"):
+        meth.process_weights_after_loading(layer)
+
+
+class _FakeDenseLayer:
+    def __init__(self, k, n, K, bounds=None):
+        self.trellis = torch.empty((k // 16, n // 16, 16 * K), dtype=torch.int16)
+        self.svh = torch.empty(n, dtype=torch.float16)
+        self.exl3_K, self.exl3_cb, self.exl3_dtype, self.exl3_cpp = K, 2, torch.bfloat16, True
+        self.exl3_bounds = bounds or [0, n]
+        self.exl3_prefix, self.exl3_tp_rank = "language_model.model.layers.0.x", 0
+        self.ms: list[int] = []
+        layer = self
+        self.quant_method = types.SimpleNamespace(apply=lambda l, x: layer.ms.append(x.shape[0]) or x)
+
+
+def test_warmup_launch_list(fake_moe_ops, monkeypatch):
+    """loadcheck.warmup (runs only on a device at boot): every distinct dense shape once at each M of DENSE_WARM_M,
+    every distinct MoE plan once at its smallest M, with in-range int32 ids and fp32 weights."""
+    loadcheck.reset_for_tests()
+    monkeypatch.setattr(torch.xpu, "synchronize", lambda *a, **k: None)
+    d1, d2, d3 = _FakeDenseLayer(256, 512, 5), _FakeDenseLayer(256, 512, 5), _FakeDenseLayer(256, 512, 6)
+    moe = types.SimpleNamespace(exl3_H=_H, exl3_I=_I, exl3_K=4, exl3_E=_E, exl3_topk=8, exl3_dtype=torch.bfloat16,
+                                exl3_ptrs=torch.zeros(_E, dtype=torch.int64), exl3_prefix="m", exl3_tp_rank=0)
+    moe2 = types.SimpleNamespace(**vars(moe))
+    b = loadcheck.Batch(1)
+    b.dense, b.moe = [d1, d2, d3], [moe, moe2]
+    res = loadcheck.warmup(b, torch.device("cpu"))
+    assert d1.ms == list(loadcheck.DENSE_WARM_M) and d2.ms == [] and d3.ms == list(loadcheck.DENSE_WARM_M)
+    fw = [c for c in fake_moe_ops["ops"].calls if c[0] == "forward"]
+    assert [c[1] for c in fw] == [1, 5, 65]
+    assert all(c[2] == torch.int32 and c[3] == (c[1], 8) and c[4] >= 0 and c[5] < _E and c[6] == torch.float32
+               and c[7:] == (_I, 4, _E) for c in fw)
+    assert (res["dense_launches"], res["moe_launches"], res["keys"]) == (26, 3, 3)
+    loadcheck.reset_for_tests()
+    fake_moe_ops["ops"] = _FakeMoeOps(miss_from=900)
+    b = loadcheck.Batch(2)
+    b.moe = [moe]
+    with pytest.raises(loadcheck.LoadCheckError, match="no MoE kernel plan at M=900"):
+        loadcheck.warmup(b, torch.device("cpu"))
+    loadcheck.reset_for_tests()
+
+
+def test_close_reserves_scratch_then_warms_on_xpu_only(lc, monkeypatch):
+    calls = []
+    monkeypatch.setattr(loadcheck, "reserve_scratch", lambda b, dev: calls.append("scratch"))
+    monkeypatch.setattr(loadcheck, "warmup", lambda b, dev: calls.append("warmup") or {"ok": 1})
+    a = _FakeDense("language_model.model.layers.0.x")
+    lc.add_layer(a, "dense")
+    lc.layer_done(a)                                          # CPU tensors: neither runs
+    assert calls == []
+    monkeypatch.setattr(loadcheck, "_device", lambda b: types.SimpleNamespace(type="xpu"))
+    c = _FakeDense("language_model.lm_head")
+    lc.add_layer(c, "dense")
+    lc.layer_done(c)
+    assert calls == ["scratch", "warmup"] and lc.CLOSED[-1]["warmup"] == {"ok": 1}

@@ -43,7 +43,7 @@ to that file as JSON lines.
 | `test_plugin_load.py` | the real load path (`model.load_weights` + `process_weights_after_loading`): EXL3XPU_LOADED counts on the 122B (every tensor, meta payloads) and the mini (real tensors), every rank; mini params and expert blobs equal the slice plan's |
 | `test_plugin_moe.py` | `Exl3MoEMethod.apply` on loaded mini layers 0 and 3 with a float64 kernel stand-in (`moe_ref.py`): id mapping, -1 padding, dead experts, 1,024-row chunks, the eager dump, EP / MoE-TP partials and their sums |
 | `test_plugin_refusals.py` | everything the plugin refuses (routing, dense loaders, expert loader, count mismatch) and `register()` per environment (`register_probe.py`) |
-| `test_plugin_units.py` | id mapping, chunking, blob sizes, name normalisation, `EXL3_VLLM_PATCHES`, loadcheck's batch bookkeeping |
+| `test_plugin_units.py` | id mapping, chunking, blob sizes, name normalisation, `EXL3_VLLM_PATCHES` (unset = none; a requested patch that does not apply aborts), loadcheck's batch bookkeeping, the variant-warmup launch list, the routed-expert method's `create_weights` refusals and `process_weights_after_loading` checks (planner miss, blob layout, missing experts, moe_info before the plan), the dump skipping all-padding batches |
 | `test_check_loaded_log.py` | the EXL3XPU_LOADED log checker below |
 | `plugin_harness.py`, `moe_ref.py`, `register_probe.py` | model builder / loader driver; float64 grouped-MoE stand-in and blob unpacker; register() in a fresh process |
 | `st_range.py`, `exact_ref.py` | byte-range safetensors reader; exact float64 EXL3 reconstruction |
