@@ -1,4 +1,5 @@
 #include <map>
+#include <cmath>
 // Host launchers + torch bindings for EXL3 ESIMD kernels.
 #include <torch/all.h>
 #include <torch/library.h>
@@ -169,14 +170,36 @@ static bool dispatch_dpas(int MB, const at::Tensor& xh, const at::Tensor& tr, co
 #define EXL3_DPAS24_NT 2
 #endif
 static int dpas_nt(int MB) { return MB == 4 ? EXL3_DPAS4_NT : MB == 8 ? EXL3_DPAS8_NT : MB == 24 ? EXL3_DPAS24_NT : (MB == 40 || MB == 48) ? 2 : (MB <= 16 ? 4 : (MB == 32 ? EXL3_DPAS32_NT : EXL3_DPAS64_NT)); }
-static int g_vec_max_m = 2;   // vector kernel for M<=2, DPAS (flat cost up to M=8) above
+// GEMV / DPAS cut-over, per trellis bit width K: rows M <= vec_max_m(K) run GemvKernel (MR1/2/4/8), larger M runs
+// DpasKernel. Default table (measured on one B70 with the Ornith-1.5-122B EXL3 tensors):
+//   K=5 -> 8: M=3..8 go to GEMV MR4 (M=3-4) / MR8 (M=5-8), both NT=4. K=5 DPAS builds its B operand from 8-lane
+//             vectors x 32 steps (DpasKernel::build, exl3_esimd.h) and is 1.67-1.91x K=4 at M=3-8, slower than K=6;
+//             K=5 GEMV pairs 4 tiles per vector op (32 lanes) and is 20-37% faster than K=5 DPAS there.
+//   others -> 2: K=4/K=6 GEMV MR4/MR8 (NT=2) are 1.6-2.4x slower than DPAS MB8 on the large shapes.
+// Knobs: exl3_set_vec_max_m(n) with n >= 0 still forces one cut-over for every K (the old global knob);
+// n < 0 drops that override and returns to the per-K table. exl3_set_vec_max_m_k(K, n) edits one table entry
+// (n < 0 restores its default). GemvKernel has at most 8 rows (MR8), so any cut-over is capped at 8.
+static constexpr int kVecMaxMDefault[9] = {2, 2, 2, 2, 2, 8, 2, 2, 2};   // index = K
+static int g_vec_max_m_k[9] = {2, 2, 2, 2, 2, 8, 2, 2, 2};
+static int g_vec_max_m = -1;  // global override for every K; -1 = use the per-K table
+static int vec_max_m_for(int K) {
+    int v = g_vec_max_m >= 0 ? g_vec_max_m : ((K >= 0 && K <= 8) ? g_vec_max_m_k[K] : 2);
+    return v > 8 ? 8 : v;
+}
 
 // Split-K sizing: threads to aim for when choosing the number of K splits. Measured on B70 (all linears,
 // graph-captured): 1024 beats 4096 by 10-20% for M=1..32 (fewer fp32 partials for had_out to reduce, and the
 // 256-GRF DPAS kernels only hold ~1024 resident threads); MB=64 prefers 2048 (77 vs 88 ms).
-static int g_target_threads = 1024;          // vector GEMV (M<=2) and DPAS MB=32
+static int g_target_threads = 1024;          // vector GEMV (M<=vec_max_m) and DPAS MB=24/32
 static int g_target_threads_mb16 = 1408;     // DPAS MB=8/16: plateau 1280-1536 (M=4 35.1->32.2 ms, M=16 38.7->36.0), cliff at 1664
 static int g_target_threads_mb64 = 2048;
+// Split-K rule on top of the targets (plan_small; fitted on split-K sweeps on one B70):
+//   g_split_alpha_pct: narrow-N guard, rows-per-split >= ceil(alpha * sqrt(Kdim/16)); 0 = off (the old rule)
+//   g_split_wave:      DPAS MB40/48/64 (256-GRF) wave model; 0 = off
+//   g_force_rps > 0:   pin rows-per-split for every call (tuning sweeps only)
+static int g_split_alpha_pct = 40;
+static int g_split_wave = 1;
+static int g_force_rps = 0;
 
 // Column-strip width (tiles per thread) per case, from bench sweeps on B70:
 // K=4 M=1 -> 8 (longer contiguous reads), K=4 M=2..4 -> 4, K=6 -> 4 (two 32-lane tile pairs), M=8 -> 2.
@@ -185,6 +208,94 @@ constexpr int tp_of(int K) { return (256 / (32 / cgcd(K, 32))) >= 32 ? 1 : 32 / 
 constexpr int nt_raw(int K, int MR) { return MR == 8 ? 2 : (K <= 4 ? (MR == 1 ? 8 : 4) : 4); }
 constexpr int nt_of(int K, int MR) { return nt_raw(K, MR) < tp_of(K) ? tp_of(K) : nt_raw(K, MR); }
 static int nt_for(int K, int MR) { return nt_of(K, MR); }
+
+static int mr_for(int M) { return M <= 1 ? 1 : (M <= 2 ? 2 : (M <= 4 ? 4 : 8)); }
+static int mb_for(int M) {
+#ifdef EXL3_DPAS_MB4
+    int MB = M <= 4 ? 4 : (M <= 8 ? 8 : (M <= 16 ? 16 : (M <= 32 ? 32 : 64)));
+#elif defined(EXL3_DPAS_MB24) && defined(EXL3_DPAS_MB48)
+    int MB = M <= 8 ? 8 : (M <= 16 ? 16 : (M <= 24 ? 24 : (M <= 32 ? 32 : (M <= 40 ? 40 : (M <= 48 ? 48 : 64)))));
+#elif defined(EXL3_DPAS_MB24)
+    int MB = M <= 8 ? 8 : (M <= 16 ? 16 : (M <= 24 ? 24 : (M <= 32 ? 32 : 64)));
+#else
+    int MB = M <= 8 ? 8 : (M <= 16 ? 16 : (M <= 32 ? 32 : 64));
+#endif
+    return MB > g_max_mb ? g_max_mb : MB;
+}
+
+// Launch plan of exl3_gemm_small for M rows, bit width K, a Kdim x N weight (one place, also exported as exl3_plan).
+struct SmallPlan {
+    int vec, MR, MB, NT, m_blocks, Mp, units, target, P, rps;
+    int rule;   // what set rps: 0 thread target, 1 narrow-N guard, 2 wave model, 3 forced
+};
+
+// Split-K for one exl3_gemm_small call. Thread = (column strip, K split of rps tile-rows); HadOutKernel then sums the
+// P = ceil(tk / rps) fp32 partials serially per (row, 128 columns). Measured on one B70 (Ornith-1.5-122B EXL3 tensors, TP4
+// slices, K = 4/5/6, M = 1..64, graph replay): time(P) fits  a * waves * rps + b * P + d  per call (R^2 ~0.998), with
+//   a ~0.4-1.3 us per tile-row (path, K), b ~0.18 us + 13 ps * M * N (one more partial: HadOut step + fp32 write/read
+//   at ~530 GB/s), waves = ceil(threads / resident threads) (2048 at 128 GRF, 1024 at 256 GRF; 32 Xe cores).
+// 1. P from the per-path thread target, as before (ceil(target / units)).
+// 2. Narrow-N guard: rps >= ceil(0.40 * sqrt(tk)). With few column strips every split runs in one wave, so
+//    a * tk / P + b * P is minimised at rps = sqrt(b / a * tk) ~ 0.4 sqrt(tk): 6 tile-rows at k=3072, 2 at k=256.
+//    The old rule gave k/v and expert-width tensors 1-3 rows per split (TP4 k/v: 192 splits of 1 row).
+// 3. DPAS MB40/48/64 only (256-GRF, 1024 resident threads): the 2048-thread target spills just past a wave on most
+//    Ornith shapes (e.g. TP4 qkv at M=64: 864 threads 55 us, 2160 threads 74 us). Evaluate the model above on an rps
+//    grid and take its minimum when it predicts >= 10% over step 2 (on the 120 measured MB48/64 curves this was never
+//    > 2% slower than the old rule; geomean 0.77x). The model is only trusted where it was fitted.
+//    MB40/48 use it only up to k = 4096 (tk <= 256): on the k=8192 o_proj/out_proj at M=40/48 (K=5/6) its one-wave
+//    pick (768 threads, 64 rows each) measured 4-7% slower than the old 2112-thread split (interleaved A/B), while
+//    the same pick at MB64 is 2-12% faster and every k <= 3072 shape (all of Ornith's TP4 slices) gains at MB40/48.
+static constexpr int kRpsGrid[] = {1, 2, 3, 4, 5, 6, 8, 10, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 512};
+static double wave_cost(int K, int units, int tk, int M, int N, int rps) {
+    const double a = K == 4 ? 0.67 : (K == 5 ? 1.05 : (K == 6 ? 0.89 : 0.90));   // us per tile-row per wave (fit)
+    int P = (tk + rps - 1) / rps;
+    int r = (tk + P - 1) / P;
+    double waves = std::ceil((double)units * P / 1024.0);
+    return a * waves * r + P * (0.18 + 13e-6 * (double)M * (double)N);
+}
+static SmallPlan plan_small(int M, int K, int Kdim, int N) {
+    SmallPlan p{};
+    p.vec = M <= vec_max_m_for(K) ? 1 : 0;
+    p.MR = mr_for(M);
+    p.MB = mb_for(M);
+    p.m_blocks = p.vec ? 1 : (M + p.MB - 1) / p.MB;
+    p.Mp = p.vec ? M : p.m_blocks * p.MB;
+    p.NT = p.vec ? nt_for(K, p.MR) : dpas_nt(p.MB);
+    int tk = Kdim / 16;
+    int n_strips = (N / 16) / p.NT;
+    p.units = n_strips * p.m_blocks;
+    p.target = p.vec ? g_target_threads
+             : (p.MB <= 16 ? g_target_threads_mb16 : (p.MB >= 40 ? g_target_threads_mb64 : g_target_threads));
+    // 1. thread target
+    int P = std::max(1, std::min(tk, (p.target + p.units - 1) / p.units));
+    int rps = (tk + P - 1) / P;
+    p.rule = 0;
+    // 2. narrow-N guard
+    if (g_split_alpha_pct > 0) {
+        // g = ceil(alpha * sqrt(tk)) in integers: the smallest g with (100 g)^2 >= alpha_pct^2 * tk
+        const long long a2tk = (long long)g_split_alpha_pct * g_split_alpha_pct * tk;
+        int g = 1;
+        while (g < tk && 10000LL * g * g < a2tk) ++g;
+        if (rps < g) { rps = g; p.rule = 1; }
+    }
+    // 3. wave model for the 256-GRF DPAS blocks (MB40/48 only up to k = 4096, see above)
+    if (!p.vec && g_split_wave && (p.MB >= 64 || (p.MB >= 40 && tk <= 256))) {
+        int best = -1;
+        double bc = 0.0;
+        for (int r : kRpsGrid) {
+            if (r > tk) break;
+            double c = wave_cost(K, p.units, tk, M, N, r);
+            if (best < 0 || c < bc - 1e-12) { best = r; bc = c; }
+        }
+        double ct = wave_cost(K, p.units, tk, M, N, tk);   // P = 1, if tk is not on the grid
+        if (ct < bc - 1e-12) { best = tk; bc = ct; }
+        if (bc < 0.9 * wave_cost(K, p.units, tk, M, N, rps)) { rps = best; p.rule = 2; }
+    }
+    if (g_force_rps > 0) { rps = std::min(g_force_rps, tk); p.rule = 3; }
+    p.rps = rps;
+    p.P = (tk + rps - 1) / rps;
+    return p;
+}
 
 template <int K, int CB>
 static bool dispatch_mr(int MR, const at::Tensor& xh, const at::Tensor& tr, const at::Tensor& shard,
@@ -216,7 +327,7 @@ template <int K, int CB>
 static bool fused_small(const at::Tensor& x, const at::Tensor& tr, const at::Tensor& suh, const at::Tensor& svh,
                         const at::Tensor& shard, at::Tensor& out, int M, int Kdim, int N, sycl::queue& q) {
     int tk = Kdim / 16, tiles_n = N / 16;
-    bool vec = M <= g_vec_max_m;
+    bool vec = M <= std::min(2, vec_max_m_for(K));   // the fused path only has MR1/MR2 vector variants
     int NT = vec ? (M <= 1 ? nt_of(K, 1) : nt_of(K, 2)) : dpas_nt(8);
     int n_strips = tiles_n / NT;
     int P = std::max(1, std::min(tk / 8, (g_target_threads + n_strips - 1) / n_strips));
@@ -268,20 +379,9 @@ void exl3_gemm_small(at::Tensor x, at::Tensor trellis, at::Tensor suh, at::Tenso
         else if (K == 6 && cb == 2) done = fused_small<6, 2>(x, trellis, suh, svh, shard_of_nb, out, M, Kdim, N, q);
         if (done) return;
     }
-    bool use_vec = M <= g_vec_max_m;
-    int MR = M <= 1 ? 1 : (M <= 2 ? 2 : (M <= 4 ? 4 : 8));
-#ifdef EXL3_DPAS_MB4
-    int MB = M <= 4 ? 4 : (M <= 8 ? 8 : (M <= 16 ? 16 : (M <= 32 ? 32 : 64)));
-#elif defined(EXL3_DPAS_MB24) && defined(EXL3_DPAS_MB48)
-    int MB = M <= 8 ? 8 : (M <= 16 ? 16 : (M <= 24 ? 24 : (M <= 32 ? 32 : (M <= 40 ? 40 : (M <= 48 ? 48 : 64)))));
-#elif defined(EXL3_DPAS_MB24)
-    int MB = M <= 8 ? 8 : (M <= 16 ? 16 : (M <= 24 ? 24 : (M <= 32 ? 32 : 64)));
-#else
-    int MB = M <= 8 ? 8 : (M <= 16 ? 16 : (M <= 32 ? 32 : 64));
-#endif
-    if (MB > g_max_mb) MB = g_max_mb;
-    int m_blocks = use_vec ? 1 : (M + MB - 1) / MB;
-    int Mp = use_vec ? M : m_blocks * MB;
+    const SmallPlan pl = plan_small(M, (int)K, Kdim, N);
+    const bool use_vec = pl.vec != 0;
+    const int MR = pl.MR, MB = pl.MB, Mp = pl.Mp, P = pl.P, rps = pl.rps;
     // blocked activations [S][Mp][Kdim] (row-blocked inside); pad rows must be zero for DPAS
     auto xh = Mp == M ? at::empty({S, Mp, Kdim}, x.options().dtype(at::kHalf))
                       : at::zeros({S, Mp, Kdim}, x.options().dtype(at::kHalf));
@@ -289,14 +389,6 @@ void exl3_gemm_small(at::Tensor x, at::Tensor trellis, at::Tensor suh, at::Tenso
     else if (x.scalar_type() == at::kBFloat16) launch_had_in<sycl::ext::oneapi::bfloat16>(x, suh, xh, q);
     else TORCH_CHECK(false, "x dtype");
 
-    int tk = Kdim / 16;
-    int n_strips = (N / 16) / (use_vec ? nt_for(K, MR) : dpas_nt(MB));
-    int units = n_strips * m_blocks;
-    int target = use_vec ? g_target_threads
-               : (MB <= 16 ? g_target_threads_mb16 : (MB >= 40 ? g_target_threads_mb64 : g_target_threads));
-    int P = std::max(1, std::min(tk, (target + units - 1) / units));
-    int rps = (tk + P - 1) / P;
-    P = (tk + rps - 1) / rps;
     auto part = at::empty({P, M, N}, x.options().dtype(at::kFloat));
 
     bool ok = false;
@@ -776,7 +868,29 @@ bool exl3_supported(int64_t K, int64_t cb) {
 void exl3_set_target_threads(int64_t n) { g_target_threads = (int)n; }
 void exl3_set_target_threads_mb64(int64_t n) { g_target_threads_mb64 = (int)n; }
 void exl3_set_target_threads_mb16(int64_t n) { g_target_threads_mb16 = (int)n; }
-void exl3_set_vec_max_m(int64_t n) { g_vec_max_m = (int)n; }
+// n >= 0: one GEMV/DPAS cut-over for every K (the old global knob); n < 0: back to the per-K table.
+void exl3_set_vec_max_m(int64_t n) { g_vec_max_m = n < 0 ? -1 : (int)n; }
+// Edit the per-K table entry (used when no global override is set); n < 0 restores the built-in default.
+void exl3_set_vec_max_m_k(int64_t K, int64_t n) {
+    TORCH_CHECK(K >= 0 && K <= 8, "exl3_set_vec_max_m_k: K out of range");
+    g_vec_max_m_k[K] = n < 0 ? kVecMaxMDefault[K] : (int)n;
+}
+// Effective cut-over for K (override or table, capped at 8).
+int64_t exl3_get_vec_max_m(int64_t K) { return vec_max_m_for((int)K); }
+// Split-K rule knobs (plan_small): narrow-N guard coefficient in percent (40 = rps >= ceil(0.40 sqrt(tk)); 0 = off),
+// and the MB40-64 wave model (1 = on, 0 = off). n < 0 leaves a knob unchanged. Both off = the old target-only rule.
+void exl3_set_split_rule(int64_t alpha_pct, int64_t wave) {
+    if (alpha_pct >= 0) g_split_alpha_pct = (int)alpha_pct;
+    if (wave >= 0) g_split_wave = wave != 0;
+}
+// Tuning only: pin rows-per-split for every small-M call (0 = use the rule).
+void exl3_set_force_rps(int64_t n) { g_force_rps = n > 0 ? (int)n : 0; }
+// The launch exl3_gemm_small would make for M rows of a Kdim x N weight at bit width K (fused path excluded):
+// [vec, MR, MB, NT, m_blocks, Mp, units, target, P, rps, threads, rule]
+std::vector<int64_t> exl3_plan(int64_t M, int64_t K, int64_t Kdim, int64_t N) {
+    SmallPlan p = plan_small((int)M, (int)K, (int)Kdim, (int)N);
+    return {p.vec, p.MR, p.MB, p.NT, p.m_blocks, p.Mp, p.units, p.target, p.P, p.rps, (int64_t)p.units * p.P, p.rule};
+}
 
 TORCH_LIBRARY(exl3xpu_C, m) {
     m.def("exl3_set_int8(int on) -> ()", &exl3_set_int8);
@@ -803,6 +917,11 @@ TORCH_LIBRARY(exl3xpu_C, m) {
     m.def("exl3_set_target_threads_mb64(int n) -> ()", &exl3_set_target_threads_mb64);
     m.def("exl3_set_target_threads_mb16(int n) -> ()", &exl3_set_target_threads_mb16);
     m.def("exl3_set_vec_max_m(int n) -> ()", &exl3_set_vec_max_m);
+    m.def("exl3_set_vec_max_m_k(int K, int n) -> ()", &exl3_set_vec_max_m_k);
+    m.def("exl3_get_vec_max_m(int K) -> int", &exl3_get_vec_max_m);
+    m.def("exl3_set_split_rule(int alpha_pct, int wave) -> ()", &exl3_set_split_rule);
+    m.def("exl3_set_force_rps(int n) -> ()", &exl3_set_force_rps);
+    m.def("exl3_plan(int M, int K, int k, int n) -> int[]", &exl3_plan);
     m.def("exl3_set_fused(int on) -> ()", &exl3_set_fused);
     m.def("exl3_set_local(int n) -> ()", &exl3_set_local);
     m.def("exl3_set_max_mb(int n) -> ()", &exl3_set_max_mb);
