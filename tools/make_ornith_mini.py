@@ -910,6 +910,7 @@ def cmd_check_config(args) -> int:
     plugin_err = None
     try:
         from exl3xpu import vllm_plugin
+        vllm_plugin.register()          # registers 'exl3' (and installs the graph guard, inert on CPU)
     except Exception as ex:   # report, then fall back to a stub so the config parse is still checked
         plugin_err = f"{type(ex).__name__}: {ex}"
         vllm_plugin = None
