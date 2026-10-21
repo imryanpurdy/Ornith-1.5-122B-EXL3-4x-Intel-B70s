@@ -155,14 +155,20 @@ def test_patch_list(monkeypatch, raw, want):
 
 
 def test_refused_patches_are_logged_not_applied(monkeypatch):
-    monkeypatch.setenv("EXL3_VLLM_PATCHES", "align_sync,gdn_mask_index,xpu_block_size,1,bogus")
+    monkeypatch.setenv("EXL3_VLLM_PATCHES", "align_sync,gdn_mask_index,xpu_block_size,1")
     called = []
     import exl3xpu.vllm_patches as vp
     for f in ("patch_align_sync", "patch_gdn_mask_index", "patch_xpu_block_size", "patch_fp8kv_prefill", "apply_all"):
         monkeypatch.setattr(vp, f, lambda *a, _f=f: called.append(_f) or True)
     res = vllm_plugin.apply_patches()
     assert res == {"align_sync": "refused", "gdn_mask_index": "refused", "xpu_block_size": "refused",
-                   "1": "refused", "bogus": "unknown"} and called == []
+                   "1": "refused"} and called == []
+
+
+def test_unknown_patch_aborts(monkeypatch):
+    monkeypatch.setenv("EXL3_VLLM_PATCHES", "fp8kv,bogus")
+    with pytest.raises(RuntimeError, match="bogus"):
+        vllm_plugin.apply_patches()
 
 
 # ------------------------------------------------------------------------------------------------ loadcheck

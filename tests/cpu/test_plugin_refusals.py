@@ -85,10 +85,15 @@ def test_register_fp8kv_only():
 
 
 def test_register_refuses_other_patches():
-    r = _probe({"EXL3_VLLM_PATCHES": "patch_align_sync,gdn_mask_index,xpu_block_size,bogus"})
+    r = _probe({"EXL3_VLLM_PATCHES": "patch_align_sync,gdn_mask_index,xpu_block_size"})
     assert r["ok"] and r["fp8kv_patched"] is False, r
-    assert ("patches=align_sync:refused,gdn_mask_index:refused,xpu_block_size:refused,bogus:unknown"
+    assert ("patches=align_sync:refused,gdn_mask_index:refused,xpu_block_size:refused"
             in r["log"]), r["log"][-3000:]
+
+
+def test_register_aborts_unknown_patch():
+    r = _probe({"EXL3_VLLM_PATCHES": "fp8kv,typo"})
+    assert not r["ok"] and "typo" in r["error"], r
 
 
 @pytest.mark.parametrize("env,needle", [({"EXL3_DRAFT_VOCAB": "/nonexistent.json"}, "EXL3_DRAFT_VOCAB"),

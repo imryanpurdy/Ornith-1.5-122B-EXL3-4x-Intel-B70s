@@ -23,7 +23,8 @@ Environment read by register():
   EXL3_VLLM_PATCHES   comma list of vllm_patches to apply; default empty. Only 'fp8kv' (patch_fp8kv_prefill) is
                       accepted on vLLM 0.30; 'align_sync', 'gdn_mask_index', 'xpu_block_size' (and the old '1' =
                       all) are refused with a log line. '0' / 'none' = none. A requested 'fp8kv' that does not
-                      apply aborts the process.
+                      apply, or a name the plugin does not recognize, aborts the process (a partial or empty
+                      patch set must never boot silently).
   EXL3_DRAFT_VOCAB    the pruned MTP draft head: refused (unvalidated on this model; a later MTP candidate).
   EXL3_CAPTURE_GUARD  'raise' or unset: the graph guard has only that mode (graph_guard.py).
 """
@@ -451,8 +452,8 @@ def _patch_list() -> list[str]:
 
 
 def apply_patches() -> dict[str, str]:
-    """EXL3_VLLM_PATCHES -> {name: applied | already | refused | unknown}; an accepted patch that does not apply
-    raises RuntimeError."""
+    """EXL3_VLLM_PATCHES -> {name: applied | already | refused | unknown}; an accepted patch that does not apply,
+    or an unrecognized name, raises RuntimeError (never boot with a patch set other than the one requested)."""
     res: dict[str, str] = {}
     for name in _patch_list():
         if name in PATCHES_ACCEPTED:
@@ -478,7 +479,9 @@ def apply_patches() -> dict[str, str]:
                            ",".join(sorted(PATCHES_ACCEPTED)))
         else:
             res[name] = "unknown"
-            logger.warning("EXL3XPU_PATCH %s unknown, ignored (accepted: %s)", name, ",".join(sorted(PATCHES_ACCEPTED)))
+            logger.error("EXL3XPU_PATCH %s unknown (accepted: %s); refusing to boot with a partial patch set",
+                         name, ",".join(sorted(PATCHES_ACCEPTED)))
+            raise RuntimeError(f"exl3: EXL3_VLLM_PATCHES entry {name!r} is not a known vllm_patch")
     return res
 
 
