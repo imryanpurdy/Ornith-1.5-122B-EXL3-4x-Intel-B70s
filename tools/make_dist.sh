@@ -83,7 +83,8 @@ EOF
 cp "$TPL/ornith-chat-template.jinja" "$TPL/qwen3_effort_parser.py" "$STAGE/templates/"
 
 # --- content id (planlib.dist_manifest: sorted "<sha256>  <relpath>" listing, sha256[:12]) ----------
-LISTING=$(cd "$STAGE" && find . -type f ! -name BUILD_INFO -printf '%P\n' | sort |
+# LC_ALL=C: byte-order sort, matching planlib.dist_manifest's Python codepoint sort of the relpaths
+LISTING=$(cd "$STAGE" && LC_ALL=C find . -type f ! -name BUILD_INFO -printf '%P\n' | LC_ALL=C sort |
   while IFS= read -r r; do printf '%s  %s\n' "$(sha256sum "$r" | cut -d' ' -f1)" "$r"; done)
 SHA12=$(printf '%s\n' "$LISTING" | sha256sum | cut -d' ' -f1 | cut -c1-12)
 ID="$C12-$SHA12"
