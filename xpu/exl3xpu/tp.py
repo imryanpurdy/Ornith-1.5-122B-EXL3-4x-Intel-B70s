@@ -412,8 +412,8 @@ def expected_loaded_counts(weight_names: Iterable[str], *, num_experts: int, moe
 
     Returns {"target": {"dense", "experts"}, "drafter": {"dense", "experts"}} with the drafter zero when
     with_mtp is False. The drafter count includes the lm_head copy: vLLM 0.30's Qwen3_5MTP.load_weights keeps
-    every "lm_head" name (qwen3_5_mtp.py:301-310) and the V2 MTP speculator replaces the drafter's lm_head with the
-    target's only after get_model() has loaded it (spec_decode/eagle/utils.py:118-132)."""
+    every "lm_head" name (qwen3_5_mtp.py:311-323) and the V2 MTP speculator replaces the drafter's lm_head with the
+    target's only after get_model() has loaded it (spec_decode/eagle/utils.py:110-132)."""
     if moe_mode not in ("ep", "tp"):
         raise ValueError(f"moe_mode must be 'ep' or 'tp', got {moe_mode!r}")
     local = _local_experts(num_experts, tp_size, tp_rank) if moe_mode == "ep" else range(num_experts)
