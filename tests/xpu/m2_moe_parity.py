@@ -32,7 +32,8 @@ Checks (DESIGN section 7, M2b table; x is bf16 with sigma 0.5 unless noted, rout
   ix    padding: rows with id -1 / weight 0 and all-padding batches, TP1 and an EP map, M in {1,4,32,1024}: exactly 0
   x     the method's chunked apply (M in {1025, 2048, 4096}) vs one unchunked moe_forward: bit-equal (else iii)
   xi    replay the MoE inputs an M2c run dumped (EXL3_DUMP_LAYER / EXL3_DUMP_DIR) through the iii oracle; record the
-        oracle's max |g|, |u|, |x * suh| per layer: finite and < 32768 (fp16 intermediates as exllamav3)
+        oracle's max |g|, |u|, |x * suh| per layer: finite and < 32768 (fp16 intermediates as exllamav3); every file
+        must hold routed (non-padding) rows and at least one file must route to a local expert
   det   dense determinism probe: TP4 shapes 2048->3072, 3072->{4096, 5120, 62080} at M in {129, 256, 512}, 8 calls
         each (INFO: identity tests stay <= 128 tokens)
 
@@ -646,9 +647,16 @@ def check_xi():
     if not files:
         rec("xi", ok=False, error=f"no dumps in {args.dump_dir!r}")
         return
+    local_pairs_total = 0
     for fpath in files:
         d = torch.load(fpath)
         L = int(re.match(r"L(\d+)_", os.path.basename(fpath)).group(1))
+        # an all-padding batch (vLLM's profile / capture warmup) routes nowhere: y = oracle = 0 and the |g| / |u|
+        # statistics are empty, so it would pass without evidence. Such a file fails; a file whose routed rows all
+        # go to other EP ranks is a valid zero check, but at least one file must exercise a local expert.
+        real_rows = int((d["topk_ids"] >= 0).any(-1).sum())
+        local_pairs = int((d["local_ids"] >= 0).sum())
+        local_pairs_total += local_pairs
         tp_size, rank = d["moe_tp"]
         a = arena(L, tp_size, rank)
         x, local, w = d["x"].to(DEV), d["local_ids"].to(DEV), d["topk_weights"].float().to(DEV)
@@ -666,8 +674,11 @@ def check_xi():
         ok, e, f = crit(y, r)
         same = torch.equal(y.cpu(), d["out"])
         fin = all(v == v and v < 32768 for v in stats.values())
-        rec("xi", file=os.path.basename(fpath), layer=L, ok=ok and fin, rms_rel=e, floor=f, replay_equal_dump=same,
+        rec("xi", file=os.path.basename(fpath), layer=L, ok=ok and fin and real_rows > 0, rms_rel=e, floor=f,
+            replay_equal_dump=same, real_rows=real_rows, local_pairs=local_pairs,
             max_g=stats.get("g"), max_u=stats.get("u"), max_x_suh=stats.get("xsuh"))
+    if local_pairs_total == 0:
+        rec("xi", ok=False, error="no dumped batch routes to a local expert (nothing was checked)")
 
 
 def check_det():

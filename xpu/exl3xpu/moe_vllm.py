@@ -20,7 +20,8 @@ MoERunner.load_weights delegates to routed_experts.load_weights.
 Environment:
   EXL3_DUMP_LAYER=<n|mtp> EXL3_DUMP_DIR=<dir> [EXL3_DUMP_MAX=16]
       eager-only debug dump of that layer's MoE inputs and output from apply() (hooks on RoutedExperts never fire:
-      the runner calls forward_modular). Files <dir>/L<n>_r<rank>_s<step>.pt. Never while a graph is recorded.
+      the runner calls forward_modular). Files <dir>/L<n>_r<rank>_s<step>.pt. Never while a graph is recorded, and
+      never for an all-padding batch (vLLM's profile and capture-warmup forwards).
 """
 from __future__ import annotations
 
@@ -254,6 +255,10 @@ def _dump(layer, x, topk_ids, topk_weights, ids, out) -> None:
         return
     if not _DUMP_DIR:
         raise RuntimeError("exl3: EXL3_DUMP_LAYER is set without EXL3_DUMP_DIR")
+    # vLLM's profile run and every pre-capture warmup forward are all padding (ids -1): they would fill the
+    # EXL3_DUMP_MAX slots with batches that route nowhere. Dump only batches with at least one routed row.
+    if not bool((topk_ids >= 0).any()):
+        return
     rank = layer.exl3_ep_rank if layer.exl3_use_ep else layer.exl3_moe_tp_rank
     os.makedirs(_DUMP_DIR, exist_ok=True)
     path = os.path.join(_DUMP_DIR, f"L{layer.exl3_layer_idx}_r{rank}_s{layer.exl3_dump_step}.pt")

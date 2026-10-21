@@ -232,3 +232,24 @@ def test_scratch_numel():
     lay = types.SimpleNamespace(trellis=torch.empty((192, 1, 1)), exl3_bounds=[0, 62080])   # k=3072, lm_head TP4
     lay2 = types.SimpleNamespace(trellis=torch.empty((128, 1, 1)), exl3_bounds=[0, 3072])   # o_proj TP4
     assert loadcheck.scratch_numel([lay, lay2]) == 3072 * 16384     # DESIGN 2.3: 96 MiB at TP1/2/4
+
+
+# ----------------------------------------------------------------------------------------------- eager dump
+def test_dump_skips_all_padding_batches(tmp_path, monkeypatch):
+    """vLLM's profile and capture-warmup forwards are all padding: they must not use up the dump slots."""
+    monkeypatch.setattr(moe_vllm, "_DUMP_LAYER", "0")
+    monkeypatch.setattr(moe_vllm, "_DUMP_DIR", str(tmp_path))
+    lay = _fake_moe_layer(_RecKernel())
+    lay.__dict__.update(exl3_dump_step=0, exl3_use_ep=False, exl3_ep_size=1, exl3_ep_rank=0, exl3_moe_tp_size=1,
+                        exl3_moe_tp_rank=0, exl3_prefix="language_model.model.layers.0.mlp.experts", exl3_H=16)
+    x = torch.randn((6, 16)).to(torch.bfloat16)
+    ids = torch.full((6, 8), -1, dtype=torch.int32)
+    w = torch.zeros((6, 8))
+    for _ in range(3):
+        moe_vllm.moe_apply(lay, x, w, ids)
+    assert sorted(p.name for p in tmp_path.iterdir()) == [] and lay.exl3_dump_step == 0
+    ids[2, 0], w[2, 0] = 3, 1.0
+    moe_vllm.moe_apply(lay, x, w, ids)
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["L0_r0_s0.pt"]
+    d = torch.load(tmp_path / "L0_r0_s0.pt")
+    assert torch.equal(d["topk_ids"], ids) and torch.equal(d["x"], x)
