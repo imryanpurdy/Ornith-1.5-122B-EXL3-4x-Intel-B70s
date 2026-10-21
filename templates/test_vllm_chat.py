@@ -52,6 +52,11 @@ CASES = [
     ("chat_template_kwargs reasoning_effort none", {"chat_template_kwargs": {"reasoning_effort": "none"}}, False, False),
     ("chat_template_kwargs reasoning_effort minimal", {"chat_template_kwargs": {"reasoning_effort": "minimal"}},
      False, False),
+    # the template compares after trim and lower; the parser must too
+    ("chat_template_kwargs reasoning_effort ' OFF '", {"chat_template_kwargs": {"reasoning_effort": " OFF "}},
+     False, False),
+    ("chat_template_kwargs reasoning_effort 'Minimal'", {"chat_template_kwargs": {"reasoning_effort": "Minimal"}},
+     False, False),
     # the template opens the think block for any enable_thinking that is not False; the parser must agree
     ("chat_template_kwargs enable_thinking=0", {"chat_template_kwargs": {"enable_thinking": 0}}, True, False),
     ("chat_template_kwargs enable_thinking=''", {"chat_template_kwargs": {"enable_thinking": ""}}, True, False),
