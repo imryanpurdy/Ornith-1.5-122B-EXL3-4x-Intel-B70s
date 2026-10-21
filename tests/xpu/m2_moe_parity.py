@@ -395,7 +395,8 @@ def emu_crit(y, r, emu, dtype, prefix=None):
     if prefix is not None:
         y, r, emu = y[:prefix], r[:prefix], emu[:prefix]
     e, g, f = rms_rel(y, r), rms_rel(y, emu.to(dtype)), rms_rel(emu.to(dtype), r)
-    return (e <= 1.5 * f + 2e-4) and (g <= 2e-4), e, f, g
+    gate = g <= 2e-4 if not DRY else True   # dry mode substitutes an oracle-like fake for the kernel
+    return (e <= 1.5 * f + 2e-4) and gate, e, f, g
 
 
 def emap_for(ep: int, r: int) -> torch.Tensor:
