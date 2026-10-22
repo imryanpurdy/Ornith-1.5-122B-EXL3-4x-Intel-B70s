@@ -29,6 +29,9 @@ Environment read by register():
   EXL3_CAPTURE_GUARD  'raise' or unset: the graph guard has only that mode (graph_guard.py).
   EXL3_KV_STATS       '1': test-only, per full-attention layer and rank max|K|/max|V| of the raw
                       K/V before the FP8 KV cache write, pass if every max < 112 (kv_stats.py).
+  EXL3_ROUTING_CHECK  '1': test-only, the MoE router's topk_ids all-gathered over the TP group for the
+                      first 64 eager steps under TP > 1, pass if every rank picks identically
+                      (routing_check.py).
 """
 from __future__ import annotations
 
@@ -497,6 +500,9 @@ def register():
     if os.environ.get("EXL3_KV_STATS", "0") == "1":
         from . import kv_stats
         kv_stats.install()
+    if os.environ.get("EXL3_ROUTING_CHECK", "0") == "1":
+        from . import routing_check
+        routing_check.install()
     if os.environ.get("EXL3_DRAFT_VOCAB"):
         raise RuntimeError("exl3: EXL3_DRAFT_VOCAB (pruned MTP draft head) is not supported by this plugin build: "
                            "unvalidated on this model and on a vocab-parallel lm_head")
