@@ -834,6 +834,49 @@ def check_xi():
         rec("xi", ok=False, error="no dumped batch routes to a local expert (nothing was checked)")
 
 
+def check_xii():
+    """M2c gate: replay each dumped serving MoE call through moe_vllm.moe_apply (same kernel, same arena, same
+    chunking at MAX_ROWS) and compare with the dumped out: bit for bit for every step; a big-M (M > 128) step may
+    only deviate by a sub-ulp relative amount (kernel reduction-order nondeterminism)."""
+    files = sorted(glob.glob(os.path.join(args.dump_dir, "L*_r*_s*.pt"))) if args.dump_dir else []
+    if not files:
+        rec("xii", ok=False, error=f"no dumps in {args.dump_dir!r}")
+        return
+    for fpath in files:
+        d = torch.load(fpath)
+        L = int(re.match(r"L(\d+)_", os.path.basename(fpath)).group(1))
+        tp_size, rank = d["moe_tp"]
+        ep_size, ep_rank = d["ep"]
+        use_ep = bool(d["use_ep"])
+        if (d["H"], d["I"], d["K"], d["E"]) != (H, IFULL, K, E):
+            rec("xii", file=os.path.basename(fpath), layer=L, ok=False,
+                error=f"shape mismatch: dump H/I/K/E {(d['H'], d['I'], d['K'], d['E'])} != harness {(H, IFULL, K, E)}")
+            continue
+        a = arena(L, tp_size, rank)
+        layer = fake_layer(a, ep_size if use_ep else 1, ep_rank if use_ep else 0)
+        layer.exl3_layer_idx = L
+        x = d["x"].to(DEV)
+        w = d["topk_weights"].float().to(DEV)
+        ids_g = d["topk_ids"].to(torch.int32).to(DEV)
+        ids_match = bool(torch.equal(moe_vllm.map_ids(layer, ids_g).cpu(), d["local_ids"].to(torch.int32)))
+        y = moe_vllm.moe_apply(layer, x, w, ids_g)
+        sync()
+        yc, dc = y.cpu(), d["out"]
+        M = int(x.shape[0])
+        same = torch.equal(yc, dc)
+        diff = (yc.float() - dc.float()).abs()
+        maxabs = float(diff.max()) if diff.numel() else 0.0
+        ref = float(dc.float().abs().max())
+        rel = maxabs / ref if ref else maxabs
+        n_diff = int((diff > 0).sum())
+        big = M > 128
+        ok = same or (big and rel <= 2e-3 and n_diff <= M * 8)
+        rec("xii", file=os.path.basename(fpath), layer=L, M=M, big_m=big, dtype=str(dc.dtype), out_dtype=str(yc.dtype),
+            bit_equal=same, maxabs=maxabs, rel=rel, n_diff=n_diff, ids_match=ids_match,
+            routed_rows=int((d["topk_ids"] >= 0).any(-1).sum()), local_pairs=int((d["local_ids"] >= 0).sum()),
+            ok=ok and ids_match)
+
+
 def check_det():
     from exl3xpu import ops
     shapes = {"o_proj 2048->3072": ("model.language_model.layers.3.self_attn.o_proj", "row"),
@@ -1299,6 +1342,8 @@ def main() -> int:
     run("emu", check_emu)
     if "xi" in CHECKS and args.dump_dir:
         run("xi", check_xi)
+    if "xii" in CHECKS and args.dump_dir:
+        run("xii", check_xii)
     run("warm", check_warm)
     for L in layers:
         run("viii", check_viii, L)
