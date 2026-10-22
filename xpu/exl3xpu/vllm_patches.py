@@ -2,8 +2,10 @@
 Targeted fixes to vLLM internals that matter on XPU. Applied from the plugin entry point, each one
 checks the exact source it expects and logs + skips if vLLM changed (never patches blindly).
 
-On vLLM 0.30 only patch_fp8kv_prefill is applied (EXL3_VLLM_PATCHES=fp8kv, vllm_plugin.apply_patches); the
-others are kept for reference and refused by the plugin.
+On vLLM 0.30 only patch_fp8kv_prefill is applied through EXL3_VLLM_PATCHES=fp8kv (vllm_plugin.apply_patches);
+the others are kept for reference and refused by the plugin. patch_det_small_linear is not an
+EXL3_VLLM_PATCHES entry: it is a correctness fix (EXL3_DET_SMALL_LINEAR=0 turns it off) and the plugin
+installs it unconditionally.
 
 gdn_mask_index: GDNAttentionMetadataBuilder.build indexes device tensors with a CPU boolean mask
   (e.g. block_table_tensor[spec_sequence_masks_cpu, :k]). That forces a pageable host->device copy of
@@ -376,6 +378,55 @@ def patch_align_sync() -> bool:
     logger.info("exl3xpu: align-mode accepted-token sync skipped except on block crossings / batch changes")
     return True
 
+
+# ------------------------------------------------------------------------------------------------
+# det_small_linear: oneDNN's XPU bf16/fp16 GEMM - the path F.linear takes for every unquantized vLLM
+# linear (GDN in_proj_ba, the MoE router gate, the shared-expert gate) - is not run-to-run bitwise
+# reproducible when the row count lands in 65..128 AND the output width is narrow. Few column tiles
+# means oneDNN splits K across workgroups and reduces the fp32 partials with atomics, so the sum order
+# varies. Measured on one B70, 100 repeats per cell, K=3072 bf16: M<=64 and M>=129 are always
+# bit-identical; M=65..128 with N in 24..192 differs on 3-100% of the repeats (N=32 at M=76: 93/100,
+# N=128 at M=90: 99/100), while N<=16 and N>=256 stay exact. 65..128 rows is exactly a 2-page
+# (2 x 64-token) prefill, which is why only that prompt-length band diverges: the perturbed rows are
+# ~1 ulp, then bf16 rounding plus MoE top-k turn them into 1e-3-level logit differences and answer
+# flips. Fix: run those calls as <=64-row GEMMs, the one regime oneDNN never splits; it costs one
+# extra tiny GEMM per affected linear (N=32/K=3072: ~5 us) and nothing outside the band.
+DET_LINEAR_ROWS = 64     # rows per chunk: <= 64 is the reproducible regime
+DET_LINEAR_MAX_M = 128   # only 64 < M <= 128 is affected
+DET_LINEAR_N_MAX = 192   # only narrow-N GEMMs split K this way (N >= 256 measured exact)
+_DET_LINEAR_DTYPES = (torch.bfloat16, torch.float16)
+
+
+def patch_det_small_linear() -> bool:
+    """Chunk the unquantized-linear GEMM to <= DET_LINEAR_ROWS rows for the 2-page prefill band."""
+    if os.environ.get("EXL3_DET_SMALL_LINEAR", "1") == "0":
+        return False
+    try:
+        from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+    except Exception as e:  # noqa: BLE001
+        logger.warning("exl3xpu: UnquantizedLinearMethod not importable (%s); det_small_linear skipped", e)
+        return False
+    if getattr(UnquantizedLinearMethod, "_exl3_det_small_linear", False):
+        return True
+    orig = UnquantizedLinearMethod.apply
+
+    def apply(self, layer, x, bias=None):
+        w = getattr(layer, "weight", None)
+        if (w is not None and w.dim() == 2 and w.shape[0] <= DET_LINEAR_N_MAX
+                and x.dim() >= 2 and x.dtype in _DET_LINEAR_DTYPES
+                and DET_LINEAR_ROWS < x.shape[0] <= DET_LINEAR_MAX_M):
+            x2 = x.reshape(-1, x.shape[-1])
+            out = torch.cat([orig(self, layer, x2[i:i + DET_LINEAR_ROWS], bias)
+                             for i in range(0, x2.shape[0], DET_LINEAR_ROWS)], dim=0)
+            return out.reshape(*x.shape[:-1], out.shape[-1])
+        return orig(self, layer, x, bias)
+
+    UnquantizedLinearMethod.apply = apply
+    UnquantizedLinearMethod._exl3_det_small_linear = True
+    logger.info("exl3xpu: unquantized linear GEMMs chunked to <= %d rows for %d..%d rows with N <= %d "
+                "(oneDNN XPU split-K is not bit-reproducible there)", DET_LINEAR_ROWS,
+                DET_LINEAR_ROWS + 1, DET_LINEAR_MAX_M, DET_LINEAR_N_MAX)
+    return True
 
 def apply_all():
     """Not used on vLLM 0.30: the plugin applies only the patches EXL3_VLLM_PATCHES names, through

@@ -27,6 +27,8 @@ Environment read by register():
                       patch set must never boot silently).
   EXL3_DRAFT_VOCAB    the pruned MTP draft head: refused (unvalidated on this model; a later MTP candidate).
   EXL3_CAPTURE_GUARD  'raise' or unset: the graph guard has only that mode (graph_guard.py).
+  EXL3_DET_SMALL_LINEAR  '0': test-only opt-out of the 2-page-prefill GEMM chunking (vllm_patches.
+                      patch_det_small_linear; installed unconditionally otherwise).
   EXL3_KV_STATS       '1': test-only, per full-attention layer and rank max|K|/max|V| of the raw
                       K/V before the FP8 KV cache write, pass if every max < 112 (kv_stats.py).
   EXL3_ROUTING_CHECK  '1': test-only, the MoE router's topk_ids all-gathered over the TP group for the
@@ -511,6 +513,11 @@ def register():
     if os.environ.get("EXL3_DRAFT_VOCAB"):
         raise RuntimeError("exl3: EXL3_DRAFT_VOCAB (pruned MTP draft head) is not supported by this plugin build: "
                            "unvalidated on this model and on a vocab-parallel lm_head")
+    from . import vllm_patches
+    if not vllm_patches.patch_det_small_linear():
+        raise RuntimeError("exl3: the det_small_linear patch did not apply (EXL3_DET_SMALL_LINEAR=0 "
+                           "is a test-only opt-out; serving without it is not bit-reproducible for "
+                           "65..128-token prefills)")
     patches = apply_patches()
     register_quantization_config("exl3")(Exl3Config)
     logger.info("EXL3XPU_PLUGIN registered quantization=exl3 patches=%s",
