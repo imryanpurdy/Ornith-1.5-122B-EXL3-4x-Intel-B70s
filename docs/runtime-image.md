@@ -131,7 +131,8 @@ devices:
 `make -j2` (higher `-j` values were OOM-killed inside a 48 GiB cap), then `patchelf --set-rpath '$ORIGIN'` on every
 `.so` — without it `import vllm_xpu_kernels` cannot find `libgrouped_gemm_xe_default.so`. `make install` only
 installs the five python extension modules, so the script copies the six kernel libraries across from the build
-tree. Budget ~70 minutes and ~4 GiB of disk for `VXK_DIR` (the torch copy dominates).
+tree. Budget ~2-2.5 h of CPU time at `-j2` (the verified full rebuild took 8131 s ≈ 135 min) and ~4 GiB of disk for
+`VXK_DIR` (the torch copy dominates).
 
 ```bash
 ./scripts/build-vxk.sh            # src, deps, torch, cfg, build, rpath, layout, verify — cached step by step

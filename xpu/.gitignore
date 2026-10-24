@@ -3,5 +3,4 @@ __pycache__/
 build/
 logs/
 *.egg-info/
-.claude/
 bench/corpus/

@@ -52,7 +52,7 @@ for arg in "$@"; do
   case "$arg" in
     start|stop|restart|status|logs) CMD="$arg" ;;
     --print) PRINT=true ;;
-    -h|--help) sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,29p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) err "unknown argument: $arg (try --help)" ;;
   esac
 done
@@ -140,11 +140,11 @@ check_prereqs() {
   [[ "$shards" -ge 1 ]] || err "MODEL_DIR has no *.safetensors shards (wrong or torn weights tree): $MODEL_DIR"
   ok "weights: $MODEL_DIR ($shards shards)"
 
-  # a card set is busy when something already answers on the port, or when another running container holds the
-  # render nodes
-  if curl -fsS -m 3 "http://127.0.0.1:$PORT/v1/models" >/dev/null 2>&1; then
-    err "port :$PORT already answers /v1/models — an engine is already serving; stop it first (docker ps)"
+  # the port must be free before anything is launched: ANY listener fails, not just an engine-looking one
+  if (exec 3<>/dev/tcp/127.0.0.1/"$PORT") 2>/dev/null; then
+    err "port :$PORT already has a listener — free it first (ss -ltnp | grep ':$PORT')"
   fi
+  # a card set is busy when another running container holds the render nodes
   local id nm devs
   for id in $(docker ps -q 2>/dev/null || true); do
     nm=$(docker inspect -f '{{.Name}}' "$id"); nm=${nm#/}
@@ -161,7 +161,7 @@ check_prereqs() {
       || err "kernels not built ($b/lib is empty) and TOOLCHAIN_IMAGE is not present locally: $TOOLCHAIN_IMAGE — docker pull it, or point BUILD_DIR at an existing build"
   fi
   [[ -f "$VXK_DIR/vllm_xpu_kernels/_C.abi3.so" ]] \
-    || err "vllm_xpu_kernels overlay not built: $VXK_DIR/vllm_xpu_kernels — run scripts/build-vxk.sh (docs/runtime-image.md §3); the engine will not start without it"
+    || err "vllm_xpu_kernels overlay not built: $VXK_DIR/vllm_xpu_kernels — run scripts/build-vxk.sh (docs/runtime-image.md §2.4); the engine will not start without it"
   ok "vllm_xpu_kernels overlay present: $VXK_DIR/vllm_xpu_kernels"
 }
 
@@ -356,7 +356,7 @@ step_ready() {
     red "nan sweep FAIL (rows above)"
     failed=1
   fi
-  if "$PY" "$SCRIPT_DIR/scripts/checks/toolcall.py" --port "$PORT" --model "$SERVED_MODEL_NAME"; then
+  if "$PY" "$SCRIPT_DIR/scripts/checks/toolcall.py" --port "$PORT" --model "$SERVED_MODEL_NAME" --count 5; then
     ok "tool calls PASS"
   else
     red "tool calls FAIL (rows above)"

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # build-vxk.sh: rebuild vllm_xpu_kernels 0.1.14.1 with the paged-decode instantiation Ornith needs at TP4, laid
-# out so the container can bind-mount it over the image's package (docs/runtime-image.md §3).
+# out so the container can bind-mount it over the image's package (docs/runtime-image.md §2.4).
 #
 #   src     clone vllm-project/vllm-xpu-kernels at VXK_REV into $VXK/src, add the one config line
 #   deps    clone oneDNN + sycl-tla at the pinned revisions into $VXK/deps (build containers run --network none)
@@ -17,8 +17,8 @@
 #   all runs every step, cached: a step whose outputs are newer than its inputs is skipped.
 # Env: RUNTIME_IMAGE, TOOLCHAIN_IMAGE (from .env), BUILD_DIR, VXK_DIR (default $BUILD_DIR/vxk), JOBS (default 2).
 #
-# CPU only. Every container is --rm, --network none, no devices. Expect ~70 min for build on 2 jobs: -j8 and -j16
-# were OOM-killed inside a 48 GiB cap on the rig this was developed on.
+# CPU only. Every container is --rm, --network none, no devices. Expect ~2-2.5 h for the build at -j2 (a verified
+# full rebuild took 8131 s): -j8 and -j16 were OOM-killed inside a 48 GiB cap on the rig this was developed on.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 REPO=$(pwd)
@@ -119,7 +119,7 @@ step_cfg() {
 }
 
 step_build() {
-  say "=== build: make -j$JOBS && make install (this is the long step, ~70 min at -j2) ==="
+  say "=== build: make -j$JOBS && make install (this is the long step, ~2-2.5 h at -j2) ==="
   [ -f "$V/cmake-build/CMakeCache.txt" ] || die "not configured; run: $0 cfg"
   "${RUN[@]}" --name ornith-vxk-build -e "JOBS=$JOBS" \
     -v "$V/cmake-build":/cb -v "$V":/out -v "$V/torch-site":/ts:ro \

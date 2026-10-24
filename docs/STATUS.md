@@ -52,7 +52,12 @@ Dense EXL3 time per card at 4-way tensor parallelism (attention, Gated DeltaNet,
 
 At 16 streams with 3 MTP draft tokens (64 rows), a whole decode step's dense work goes from 10.19 ms to 6.70 ms per card.
 
-## Next
+## Milestones 2-5 (done)
 
-- K=4 grouped MoE kernel (Ornith shapes), and tensor-parallel loading for the dense EXL3 linears.
-- The vLLM EXL3 MoE method, then milestones 2–5.
+Milestones 2-5 are complete: the EXL3 MoE method in vLLM matches the reference on one card (2), two cards match
+one (3), Ornith boots and answers on four (4), and long-context recall, tool calls, throughput and a 60-minute soak
+all pass (5). The evidence is the measured tables in [README.md](../README.md#measured), the status table in
+[README.md](../README.md#status), and the honesty note there on the final gate bundle's verdict.
+
+Open: the manual KV-bytes variant, the source fix for the capture leak behind the first-request guard, and replacing
+the near-tie fill probe with a non-near-tie one (see README's Open list).

@@ -66,8 +66,10 @@ Docker builds use the repository root as the build context, so both images get `
 
 ```bash
 docker build -f cuda/docker/Dockerfile.dev -t sglang-exl3:dev .
-docker build -f xpu/docker/Dockerfile -t exl3xpu .
 ```
+
+The B70 `exl3xpu` image build is not in this repository any more: see [docs/runtime-image.md](docs/runtime-image.md)
+for what the runtime image is and how to obtain it.
 
 CPU tests: `cd core && python -m pytest`.
 
