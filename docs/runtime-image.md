@@ -63,9 +63,9 @@ every number in this repository was measured on the image already present on the
 
 ### 1.3 What this repository does *not* ship
 
-`xpu/docker/Dockerfile` builds the *older* plugin-image layout on `intel/llm-scaler-vllm:0.26.0-b2` — an unrelated
-base, from before the engine image existed. It is kept for history only. `start.sh` does not use it, and this
-repository publishes no image anywhere.
+This repository does not ship or publish any image. The *older* plugin-image layout on
+`intel/llm-scaler-vllm:0.26.0-b2` — an unrelated base, from before the engine image existed — was removed with the
+upstream-project cleanup; `start.sh` never used it.
 
 ## 2. The `vllm_xpu_kernels` overlay (required, not optional)
 

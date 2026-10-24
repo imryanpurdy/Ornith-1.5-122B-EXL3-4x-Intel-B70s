@@ -34,8 +34,7 @@ To build from source, see [`cuda/README.md`](cuda/README.md).
 IMG=ghcr.io/0xsero/exl3xpu@sha256:21412bdd7535e9c653eeb3d099dce3bc79a83d440def2cd9556111c79c870fa8
 ```
 
-The run command, flags and GPU selection are in [`xpu/README.md`](xpu/README.md), and the tested recipe is
-[in the registry](https://github.com/0xSero/local-ai-registry/blob/main/data/registry/recipe/qwen38-27b-exl3-4bpw-arcb70-vllm-exl3xpu-tp1.json).
+The current B70 recipe in this repository (Ornith-1.5-122B EXL3, TP4, vLLM XPU) is [README.md](README.md).
 
 ### Other GPUs
 
