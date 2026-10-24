@@ -10,7 +10,6 @@ The EXL3 kernels and the vLLM plugin come from [trellis-serve](https://github.co
 upstream README is kept as [TRELLIS-SERVE-README.md](TRELLIS-SERVE-README.md); [ORIGIN.md](ORIGIN.md) records the
 exact source commit.
 
-This repository is private: the clone URL returns 404 without an invitation; access is by request.
 
 ## What this is
 
