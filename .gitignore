@@ -17,3 +17,6 @@ dist/
 *.bin
 *.gguf
 *.pt
+
+# start.sh runtime state (dist, caches, logs)
+.run/
