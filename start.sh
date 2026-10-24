@@ -4,6 +4,7 @@
 #
 #   git clone <this repo> && cd <this repo>
 #   cp .env.example .env      # MODEL_DIR, and RUNTIME_IMAGE if the pinned image is not present
+#   ./scripts/build-vxk.sh    # once: the vllm_xpu_kernels overlay (~2-2.5 h CPU-only at -j2, needs network)
 #   ./start.sh
 #
 # Commands: start | stop | status | logs   (default: start)
@@ -141,7 +142,8 @@ check_prereqs() {
   ok "weights: $MODEL_DIR ($shards shards)"
 
   # the port must be free before anything is launched: ANY listener fails, not just an engine-looking one
-  if (exec 3<>/dev/tcp/127.0.0.1/"$PORT") 2>/dev/null; then
+  # (timeout bounds the connect in case loopback traffic is ever filtered)
+  if timeout 2 bash -c 'exec 3<>/dev/tcp/127.0.0.1/'"$PORT" 2>/dev/null; then
     err "port :$PORT already has a listener — free it first (ss -ltnp | grep ':$PORT')"
   fi
   # a card set is busy when another running container holds the render nodes

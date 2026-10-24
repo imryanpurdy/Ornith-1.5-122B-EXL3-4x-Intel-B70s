@@ -146,9 +146,13 @@ nothing). Boots poll `/v1/models` for up to `READY_WAIT_SECONDS` (default 1800 s
 
 Serving.
 
-The final full gate bundle's own verdict was **NOT PASSED (full)**: its `nan_sweep_concurrency` row ran 13/14. The
-one miss is the knife-edge fill probe truncating at concurrency 14 (the `17<eos>` near-tie); it was accepted at
-cutover after 800 real fill prompts showed zero truncations. `nan_sweep_strict` passed 14/14 in the same bundle.
+Two gate rows are recorded here honestly, from two different runs. The final full gate bundle (18:21Z boot)
+holds verdict **NOT PASSED (full)**: its `nan_sweep_concurrency` row ran 13/14, with the one miss at concurrency 3 —
+the documented KNOWN fill-12 `401` flip counted as a failure by a one-line counting bug in that gate harness's round
+loop (the flip itself is documented; the counting bug was left as-is and never hidden); `nan_sweep_strict` passed
+14/14 in the same bundle. Separately, a partial re-run (20:17Z boot) of the concurrency row showed a different
+signature: the knife-edge fill probe truncated to `17<eos>` at concurrency 14. That near-tie truncation was accepted
+at cutover after 800 real fill prompts showed zero truncations at concurrency 14.
 
 | Milestone | State |
 |---|---|

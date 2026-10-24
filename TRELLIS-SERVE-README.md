@@ -58,7 +58,7 @@ On the B70 that is 3.6 times llama.cpp's Q4_K_M at one user and 6.5 times at six
 ```
 core/    trellis_core: format reader (no torch) + reference decoder (torch); CPU tests
 cuda/    sglang_exl3: SGLang plugin, Marlin-style EXL3 kernels for sm_86 (cuda/csrc), dev Dockerfile, serve scripts
-xpu/     exl3xpu: vLLM and SGLang plugins, ESIMD kernels for Intel Xe2 (xpu/csrc), Dockerfile, tests, benchmarks
+xpu/     exl3xpu: vLLM and SGLang plugins, ESIMD kernels for Intel Xe2 (xpu/csrc), tests, benchmarks
 docs/    the lossless check
 ```
 
