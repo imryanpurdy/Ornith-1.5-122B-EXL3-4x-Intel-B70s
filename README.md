@@ -131,10 +131,27 @@ Send two or three short requests after a boot before the first long prompt (see 
 ./start.sh stop
 ```
 
-`start.sh` takes the name from `CONTAINER_NAME` in `.env` and prints it at launch; `stop` is just
-`docker rm -f "$CONTAINER_NAME"` with the name resolved from `.env`. The other subcommands are `status` (container
-and API state), `logs` (`docker logs -f`) and `--print` (print the full `docker run` line and the gate plan, run
-nothing). Boots poll `/v1/models` for up to `READY_WAIT_SECONDS` (default 1800 s) — raise it on a slower host.
+`start.sh` takes the name from `CONTAINER_NAME` in `.env` and prints it at launch. It only ever stops, removes or
+replaces a container it created itself: every container it starts carries the labels `ornith.created-by=start.sh`,
+`ornith.checkout=<an id of this checkout>` and `ornith.port=<port>`. `stop`:
+
+1. refuses, and leaves the container exactly as it is, when a container of that name lacks the first two labels
+   (another deployment, another checkout, or one started by an older `start.sh`), or is paused or restarting;
+2. removes its own stopped container with a plain `docker rm`;
+3. for its own running container, waits until the engine's `/metrics` reports no running requests (up to
+   `STOP_DRAIN_SECONDS`, default 300), sends SIGTERM, waits up to `STOP_WAIT_SECONDS` (default 180) for the engine
+   to exit, then removes the container. If `/metrics` does not answer, requests are still running, or the engine
+   does not exit in time, it refuses and exits non-zero.
+
+It never sends SIGKILL and never runs `docker rm -f` or `docker stop`: on the `xe` driver, killing an engine with
+GPU kernels in flight has reset the GPU engine. A plain `./start.sh` refuses the same way when a container of that
+name exists and is not its own, or when its own is still running; `restart` is `stop`, then a fresh start.
+
+The other subcommands are `status` (container, owner and API state), `logs` (`docker logs -f`) and `--print` (print
+the full `docker run` line and the gate plan, run nothing). The printed line carries the three ownership labels
+next to `ornith.config`; labels are bookkeeping, not serve configuration, and the serve arguments and container
+environment are unchanged by them. Boots poll `/v1/models` for up to `READY_WAIT_SECONDS` (default 1800 s) — raise
+it on a slower host.
 
 ## Known limits
 

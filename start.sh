@@ -7,11 +7,20 @@
 #   ./scripts/build-vxk.sh    # once: the vllm_xpu_kernels overlay (~2-2.5 h CPU-only at -j2, needs network)
 #   ./start.sh
 #
-# Commands: start | stop | status | logs   (default: start)
+# Commands: start | stop | restart | status | logs   (default: start)
 #   ./start.sh --print     print the docker run line and the gate plan, run nothing
-#   ./start.sh stop        remove the container
+#   ./start.sh stop        stop and remove this checkout's container (drain, SIGTERM, bounded wait; never SIGKILL)
+#   ./start.sh restart     stop, then start
 #   ./start.sh status      container + API state
 #   ./start.sh logs        docker logs -f
+#
+# Containers: start.sh only ever stops, removes or replaces a container it created itself. It labels every
+# container it creates (ornith.created-by=start.sh, ornith.checkout=<id of this checkout>, ornith.port=<port>).
+# A container named CONTAINER_NAME without both of the first two labels (another deployment, another checkout,
+# an older start.sh) makes it refuse and exit non-zero without touching anything. Its own running container is
+# stopped only after the engine reports no running requests (waiting up to STOP_DRAIN_SECONDS, default 300), with
+# SIGTERM and a bounded wait (STOP_WAIT_SECONDS, default 180). It never sends SIGKILL and never runs docker rm -f
+# or docker stop: on the xe driver, killing an engine with GPU kernels in flight has reset the GPU engine.
 #
 # Path: prereqs -> kernels (cached) -> plugin dist -> docker run -> first-request guard -> READY gates.
 #
@@ -27,8 +36,8 @@
 # Three short requests first leave the queue clean, after which the first real request can be any length.
 # So: three "Say OK." requests, max_tokens 8, before the READY gates (the API is already listening meanwhile).
 #
-# A guard failure tears the container down (it is not going to serve). A READY-gate failure leaves it up for
-# inspection and exits non-zero.
+# A guard failure stops the container the same way as ./start.sh stop (it is not going to serve). A READY-gate
+# failure leaves it up for inspection and exits non-zero.
 # ============================================================================
 set -euo pipefail
 
@@ -55,11 +64,11 @@ for arg in "$@"; do
   case "$arg" in
     start|stop|restart|status|logs) CMD="$arg" ;;
     --print) PRINT=true ;;
-    -h|--help) sed -n '2,31p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) awk 'NR > 2 && /^# ====/ { exit } NR > 2' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) err "unknown argument: $arg (try --help)" ;;
   esac
 done
-[[ "$CMD" == restart ]] && CMD=start
+[[ "$PRINT" == true && "$CMD" != start ]] && err "--print runs nothing, so it cannot be combined with '$CMD'"
 
 # ---------------------------------------------------------------------------
 # .env
@@ -93,15 +102,131 @@ is_num "$MTP_K" && [[ "$MTP_K" =~ ^[0-9]+$ ]] || err "MTP_K must be an integer (
 IFS=',' read -r -a CARDS <<< "$GPUS"
 [[ "${#CARDS[@]}" -eq 4 ]] || err "GPUS must list exactly 4 card indices for TP4 (got '$GPUS')"
 ZE_AFFINITY_MASK="$GPUS"
+STOP_DRAIN="${STOP_DRAIN_SECONDS:-300}"
+STOP_WAIT="${STOP_WAIT_SECONDS:-180}"
+is_posint "$STOP_DRAIN" || err "STOP_DRAIN_SECONDS must be a positive integer (got '$STOP_DRAIN')"
+is_posint "$STOP_WAIT" || err "STOP_WAIT_SECONDS must be a positive integer (got '$STOP_WAIT')"
 
 # ---------------------------------------------------------------------------
-# status / logs / stop
+# Container ownership: start.sh only ever stops, removes or replaces a container it created itself
+#   Every container it creates carries LABEL_BY=start.sh and LABEL_CHECKOUT=<CHECKOUT_ID> (plus LABEL_PORT, the
+#   port it serves on, which the drain check reads). CHECKOUT_ID is derived from this checkout's directory, so a
+#   second checkout never claims the first one's container. Anything else with the same name is refused.
 # ---------------------------------------------------------------------------
+LABEL_BY=ornith.created-by
+LABEL_CHECKOUT=ornith.checkout
+LABEL_PORT=ornith.port
+CHECKOUT_ID=$(printf '%s' "$SCRIPT_DIR" | sha256sum | cut -c1-16)
+
+refuse() { printf '\033[1;31m[REFUSED]\033[0m %s\n' "$*" >&2; log "REFUSED $*"; exit 2; }
+
 running() { docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$1"; }
+# container state (created, running, paused, restarting, removing, exited, dead); empty when there is none
+cstate()  { docker inspect --type container -f '{{.State.Status}}' "$1" 2>/dev/null; }
+# one label of a container; empty when the label (or the container) is missing
+clabel()  { docker inspect --type container -f "{{index .Config.Labels \"$2\"}}" "$1" 2>/dev/null; }
+# true only for a container this checkout's start.sh created
+ours()    { [[ "$(clabel "$1" "$LABEL_BY" || true)" == start.sh && "$(clabel "$1" "$LABEL_CHECKOUT" || true)" == "$CHECKOUT_ID" ]]; }
 
+not_ours() {
+  local by co
+  by=$(clabel "$1" "$LABEL_BY" || true); co=$(clabel "$1" "$LABEL_CHECKOUT" || true)
+  if [[ "$by" == start.sh ]]; then
+    printf "container '%s' was created by start.sh in another checkout (%s=%s; this checkout is %s)" \
+      "$1" "$LABEL_CHECKOUT" "${co:-<none>}" "$CHECKOUT_ID"
+  else
+    printf "container '%s' was not created by start.sh (it has no %s=start.sh label)" "$1" "$LABEL_BY"
+  fi
+}
+
+# the engine's vllm:num_requests_running, summed; empty when /metrics does not answer
+requests_running() {
+  curl -fsS -m 5 "http://127.0.0.1:$1/metrics" 2>/dev/null \
+    | awk '/^vllm:num_requests_running[{ ]/ { s += $NF; n++ } END { if (n) printf "%d\n", s }'
+}
+
+# name_free check|apply: CONTAINER_NAME must be unused, or hold this checkout's own STOPPED container.
+#   check: report only (prerequisites).  apply: also remove that stopped container (plain docker rm, which refuses
+#   a running container, so it cannot kill anything). A running container of that name, or one start.sh did not
+#   create, is refused either way.
+name_free() {
+  local st
+  st=$(cstate "$CONTAINER_NAME" || true)
+  [[ -z "$st" ]] && return 0
+  ours "$CONTAINER_NAME" \
+    || refuse "$(not_ours "$CONTAINER_NAME"). start.sh will not stop, remove or replace it. Set another CONTAINER_NAME in .env, or deal with that container the way it was started."
+  case "$st" in
+    created|exited|dead)
+      if [[ "$1" == apply ]]; then
+        docker rm "$CONTAINER_NAME" >/dev/null || refuse "docker rm $CONTAINER_NAME failed (state $st); left as is"
+        info "removed this checkout's earlier stopped container $CONTAINER_NAME (state $st)"
+      else
+        info "this checkout's earlier container $CONTAINER_NAME is stopped (state $st); it is removed at launch"
+      fi ;;
+    running) refuse "this checkout's container $CONTAINER_NAME is already running: ./start.sh stop (or ./start.sh restart) first" ;;
+    *) refuse "this checkout's container $CONTAINER_NAME is '$st'; start.sh only replaces a stopped one. Left as is." ;;
+  esac
+}
+
+# stop_own NAME: stop and remove this checkout's own container NAME. Returns once NAME no longer exists; refuses
+# (exit 2, container left exactly as it is) in every other case.
+stop_own() {
+  local name=$1 st port r deadline
+  st=$(cstate "$name" || true)
+  if [[ -z "$st" ]]; then info "no container named $name"; return 0; fi
+  ours "$name" \
+    || refuse "$(not_ours "$name"). start.sh will not stop or remove it; stop it the way it was started."
+  case "$st" in
+    created|exited|dead)
+      docker rm "$name" >/dev/null || refuse "docker rm $name failed (state $st); left as is"
+      ok "removed this checkout's stopped container $name (state $st)"
+      return 0 ;;
+    running) ;;
+    *) refuse "container $name is '$st'; start.sh only stops a running container or removes a stopped one. Left as is." ;;
+  esac
+  port=$(clabel "$name" "$LABEL_PORT" || true)
+  is_posint "$port" || port=$PORT
+  # 1. drain: never signal an engine that is serving a request (a request in flight means GPU kernels in flight)
+  deadline=$(( $(date +%s) + STOP_DRAIN ))
+  while :; do
+    r=$(requests_running "$port" || true)
+    [[ -n "$r" ]] || refuse "$name does not answer /metrics on :$port, so start.sh cannot confirm that nothing is in flight; it was not signalled. Wait until it answers (or exits on its own), then run ./start.sh stop again."
+    [[ "$r" -eq 0 ]] && break
+    [[ "$(date +%s)" -lt "$deadline" ]] \
+      || refuse "$r request(s) still running on :$port after ${STOP_DRAIN}s (STOP_DRAIN_SECONDS); $name was not signalled. Stop its clients, then run ./start.sh stop again."
+    info "$r request(s) running on :$port; waiting for them to finish (up to ${STOP_DRAIN}s)"
+    sleep 5
+  done
+  # 2. SIGTERM only: docker kill --signal SIGTERM never escalates (docker stop would SIGKILL after its timeout)
+  info "no requests running; sending SIGTERM to $name and waiting up to ${STOP_WAIT}s for it to exit (no SIGKILL)"
+  log "STOP $name: SIGTERM"
+  docker kill --signal SIGTERM "$name" >/dev/null || refuse "could not send SIGTERM to $name; left as is"
+  deadline=$(( $(date +%s) + STOP_WAIT ))
+  while [[ "$(cstate "$name" || true)" == running ]]; do
+    [[ "$(date +%s)" -lt "$deadline" ]] \
+      || refuse "$name is still running ${STOP_WAIT}s (STOP_WAIT_SECONDS) after SIGTERM. start.sh does not escalate to SIGKILL: check docker logs $name, give it longer, then run ./start.sh stop again."
+    sleep 2
+  done
+  # 3. remove it: plain docker rm (it refuses a running container)
+  st=$(cstate "$name" || true)
+  if [[ -n "$st" ]]; then
+    docker rm "$name" >/dev/null || refuse "$name exited but docker rm failed (state $st); left as is"
+  fi
+  log "STOP $name: exited after SIGTERM, removed"
+  ok "container $name stopped (SIGTERM) and removed"
+}
+
+# ---------------------------------------------------------------------------
+# status / logs / stop / restart
+# ---------------------------------------------------------------------------
 if [[ "$CMD" == status ]]; then
-  if running "$CONTAINER_NAME"; then
-    echo "container : $(docker inspect -f '{{.State.Status}} (up since {{.State.StartedAt}})' "$CONTAINER_NAME")"
+  if [[ -n "$(cstate "$CONTAINER_NAME" || true)" ]]; then
+    echo "container : $(docker inspect --type container -f '{{.State.Status}} (up since {{.State.StartedAt}})' "$CONTAINER_NAME")"
+    if ours "$CONTAINER_NAME"; then
+      echo "owner     : this checkout's start.sh"
+    else
+      echo "owner     : NOT this checkout's start.sh — $(not_ours "$CONTAINER_NAME"); start.sh will not stop it"
+    fi
   else
     echo "container : NOT RUNNING"
   fi
@@ -115,10 +240,11 @@ if [[ "$CMD" == status ]]; then
   exit 0
 fi
 if [[ "$CMD" == logs ]]; then exec docker logs -f "$CONTAINER_NAME"; fi
-if [[ "$CMD" == stop ]]; then
+if [[ "$CMD" == stop || "$CMD" == restart ]]; then
   info "=== stop ==="
-  if running "$CONTAINER_NAME"; then docker rm -f "$CONTAINER_NAME" >/dev/null; ok "container $CONTAINER_NAME removed"; else info "not running"; fi
-  exit 0
+  stop_own "$CONTAINER_NAME"
+  [[ "$CMD" == stop ]] && exit 0
+  CMD=start
 fi
 
 # ---------------------------------------------------------------------------
@@ -131,6 +257,9 @@ check_prereqs() {
   command -v curl >/dev/null 2>&1 || err "curl not found on PATH (used for the guard and READY gates)"
   PY="$(command -v python3 || true)"
   [[ -n "$PY" ]] || err "python3 not found on PATH (the READY gates are python3 scripts)"
+
+  # the container name: unused, or this checkout's own stopped container (anything else is refused, untouched)
+  name_free check
 
   docker image inspect "$RUNTIME_IMAGE" >/dev/null 2>&1 \
     || err "RUNTIME_IMAGE is not present locally: $RUNTIME_IMAGE — see docs/runtime-image.md for what it is and how to obtain it (docker pull / docker buildx build)"
@@ -148,13 +277,14 @@ check_prereqs() {
   if timeout 2 bash -c 'exec 3<>/dev/tcp/127.0.0.1/'"$PORT" 2>/dev/null; then
     err "port :$PORT already has a listener — free it first (ss -ltnp | grep ':$PORT')"
   fi
-  # a card set is busy when another running container holds the render nodes
+  # a card set is busy when any running container holds the render nodes. There is no exemption, not even for a
+  # container named CONTAINER_NAME (name_free above has already refused a running one).
   local id nm devs
   for id in $(docker ps -q 2>/dev/null || true); do
     nm=$(docker inspect -f '{{.Name}}' "$id"); nm=${nm#/}
     devs=$(docker inspect -f '{{range .HostConfig.Devices}}{{.PathOnHost}} {{end}}' "$id")
     case " $devs " in
-      *"/dev/dri"*) [[ "$nm" == "$CONTAINER_NAME" ]] || err "cards busy: container '$nm' holds /dev/dri — stop it first (docker rm -f $nm)" ;;
+      *"/dev/dri"*) err "cards busy: container '$nm' holds /dev/dri. start.sh does not stop containers it did not create: stop it the way it was started (let its requests finish first), then re-run" ;;
     esac
   done
   ok "cards free: nothing on :$PORT, no other container holds /dev/dri"
@@ -286,7 +416,11 @@ build_run() {
     { cat "$SCRIPT_DIR/env.list"; cat "$DIST_DIR/BUILD_INFO" 2>/dev/null || true
       docker image inspect -f '{{.Id}}' "$RUNTIME_IMAGE" 2>/dev/null || printf '%s\n' "$RUNTIME_IMAGE"
       printf '%s\n' "${SERVE_ARGS[@]}"; } | sha256sum | cut -d' ' -f1)
-  DOCKER_RUN=(docker run "${RUN_ARGS[@]}" --label "ornith.config=$CONFIG_SHA" --entrypoint /opt/venv/bin/vllm "$RUNTIME_IMAGE" "${SERVE_ARGS[@]}")
+  # ownership labels (bookkeeping, not serve configuration): what stop / restart / relaunch check before touching
+  # a container of this name
+  DOCKER_RUN=(docker run "${RUN_ARGS[@]}" --label "ornith.config=$CONFIG_SHA"
+              --label "$LABEL_BY=start.sh" --label "$LABEL_CHECKOUT=$CHECKOUT_ID" --label "$LABEL_PORT=$PORT"
+              --entrypoint /opt/venv/bin/vllm "$RUNTIME_IMAGE" "${SERVE_ARGS[@]}")
 }
 
 # print the array as one readable shell line: tokens with spaces get single quotes, everything else verbatim
@@ -306,8 +440,9 @@ print_plan() {
   info "=== plan (--print: nothing is executed) ==="
   echo
   echo "# 1. prerequisites: .env complete, docker, python3, $RUNTIME_IMAGE present locally,"
-  echo "#    $MODEL_DIR with config.json + shards, nothing on :$PORT, no other container on /dev/dri,"
-  echo "#    $VXK_DIR/vllm_xpu_kernels present"
+  echo "#    $MODEL_DIR with config.json + shards, nothing on :$PORT, no running container on /dev/dri,"
+  echo "#    $VXK_DIR/vllm_xpu_kernels present, and no container named $CONTAINER_NAME unless this"
+  echo "#    checkout's start.sh created it (label $LABEL_CHECKOUT=$CHECKOUT_ID) and it is stopped"
   echo "# 2. kernels: scripts/build-kernels.sh into $BUILD_DIR (skipped when the outputs are newer than xpu/csrc)"
   echo "# 3. dist: $RUN_DIR/dist from xpu/exl3xpu + $BUILD_DIR/lib/*.so + templates/ + core/src/trellis_core"
   echo "# 4. docker run (below), then wait for /v1/models and 'Application startup complete'"
@@ -324,10 +459,11 @@ print_plan() {
 # ---------------------------------------------------------------------------
 guard_fail() {
   red "FIRST-REQUEST GUARD FAILED: $*"
-  warn "tearing the container down (it will not serve)"
-  docker logs --tail 40 "$CONTAINER_NAME" 2>&1 | tail -40 || true
-  docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
   log "GUARD_FAIL $*"
+  docker logs --tail 40 "$CONTAINER_NAME" 2>&1 | tail -40 || true
+  warn "stopping the container (it will not serve): drain, SIGTERM, bounded wait, never SIGKILL"
+  ( stop_own "$CONTAINER_NAME" ) \
+    || warn "container $CONTAINER_NAME was left as it is (reason above); run ./start.sh stop once it is idle"
   exit 1
 }
 
@@ -393,8 +529,8 @@ build_run
 
 info "=== step 3: launching $CONTAINER_NAME ($SERVED_MODEL_NAME on :$PORT) ==="
 mkdir -p "$RUN_DIR/cache" "$RUN_DIR/sycl-cache"
-docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
-log "launch config=$CONFIG_SHA image=$RUNTIME_IMAGE model=$MODEL_DIR dist=$DIST_DIR"
+name_free apply   # re-checked at launch: refuses anything but this checkout's own stopped container
+log "launch config=$CONFIG_SHA checkout=$CHECKOUT_ID image=$RUNTIME_IMAGE model=$MODEL_DIR dist=$DIST_DIR"
 print_cmd >> "$RUN_DIR/start.log"
 "${DOCKER_RUN[@]}" >/dev/null
 ok "container started: $CONTAINER_NAME (config $CONFIG_SHA)"
