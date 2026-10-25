@@ -59,5 +59,5 @@ one (3), Ornith boots and answers on four (4), and long-context recall, tool cal
 all pass (5). The evidence is the measured tables in [README.md](../README.md#measured), the status table in
 [README.md](../README.md#status), and the honesty note there on the final gate bundle's verdict.
 
-Open: the manual KV-bytes variant, the source fix for the capture leak behind the first-request guard, and replacing
-the near-tie fill probe with a non-near-tie one (see README's Open list).
+Open: the manual KV-bytes variant, the source fix for the capture leak behind the first-request guard, replacing
+the fill-12 probe with one whose fp8 answer margin has been measured, and the other items in README's Open list.

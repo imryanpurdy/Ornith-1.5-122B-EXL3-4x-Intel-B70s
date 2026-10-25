@@ -53,8 +53,9 @@ cp .env.example .env       # set MODEL_DIR to the weights and RUNTIME_IMAGE to t
 
 **Not yet run end to end:** `start.sh`'s cold launch path (kernel build, dist, `docker run`, first-request guard,
 READY gates) has never launched an engine. The validated deployment was started by a separate launch script with
-the same image, serve arguments and container environment (`./start.sh --print` matches it argument for argument);
-of `start.sh` itself only `--print` and dry runs against a stand-in `docker` have been exercised.
+the same image. Its 43 serve arguments and its container environment match `./start.sh --print` when `.env` sets
+the same model id and port; host paths, the container name and the container labels differ. Of `start.sh` itself
+only `--print` and dry runs against a stand-in `docker` have been exercised.
 
 `scripts/build-vxk.sh` is a separate, once-only step: it builds the `vllm_xpu_kernels` overlay the engine cannot
 start without, needs network for its source and dependency clones, and caches its output in `$VXK_DIR`.
@@ -161,19 +162,23 @@ it on a slower host.
 1. **Answer flips on the fill probe.** Greedy answers on some prompts differ between fp8 and bf16 KV, and between
    batch sizes. The documented family is the `17*23 = 391` fill task. Fill 3 (with fp8 KV) and fill 75 (with bf16
    KV) have flipped every time so far; fills 12 and 150 flip intermittently:
-   - fill 3 answers `401` with fp8 KV in every sweep on the shipping config so far (15 of 15), and `391` with bf16;
+   - fill 3 answers `401` with fp8 KV in every sweep on the shipping config so far (15 of 15), and `391` with bf16
+     on the current build (4 of 4 bf16 sweeps; the one bf16 `401`, in 9 bf16 sweeps, came from an earlier build
+     with a since-fixed oneDNN GEMM nondeterminism at 65–128-token prompts);
    - fill 12 answers `391` when it runs alone (34 of 34), but in 84 batched rounds it answered `401` four times and
      stopped after `17` twice (see Status);
    - fill 75 answers `401` with bf16 KV only (9 of 9 bf16 sweeps); with fp8 it has answered `391` every time (16 of 16);
    - fill 150 answered `401` once in 15 sweeps.
 
    The `401` answers are well-formed, with finite logprobs. The READY sweep accepts `401` at these four fills as a
-   known answer; the flips are documented, not fixed. A paired A/B (recall at 60K/118K/200K, 220 short checkable
-   prompts, tool calls) put fp8 within noise of bf16 on every set; on the short A/B set fp8 scored 219/220 against
-   bf16's 220/220 — one fp8-only miss, judged within noise by the frozen rule. That A/B ran on the no-MTP build at
-   `--max-num-seqs 32`, greedy, one request at a time, with thinking on, and it did not include the thinking-off
-   fill-3 case above. It has not yet been repeated on the shipping config (MTP k=2, `--max-num-seqs 16`); that
-   re-run is scheduled.
+   known answer; the flips are documented, not fixed. Each of those four entries was added after the failure it
+   exempts, and the sweep matches the known answer as a substring rather than exactly; both are under review, and
+   neither turns a recorded gate failure into a pass (see Status). A paired A/B (recall at 60K/118K/200K, 220 short
+   checkable prompts, tool calls) put fp8 within noise of bf16 on every set; on the short A/B set fp8 scored
+   219/220 against bf16's 220/220 — one fp8-only miss, judged within noise by the frozen rule. That A/B ran on the
+   no-MTP build at `--max-num-seqs 32`, greedy, one request at a time, with thinking on, and it did not include the
+   thinking-off fill-3 case above. It has not yet been repeated on the shipping config (MTP k=2,
+   `--max-num-seqs 16`); that re-run is scheduled.
 2. **MTP draft-KV cost.** The 2-token draft layer reserves its own KV: about 282K tokens, ~19.9% of the no-MTP
    pool, compared at the same `--max-num-seqs`:
    - at 16: 282,359 tokens (19.85%), the shipping 1,140,422 against a no-MTP reading whose boot log was not kept;
@@ -190,10 +195,12 @@ it on a slower host.
    oneMKL), and the source of the leak is unproven. Three short requests first leave the queue clean, and every
    long request after that has been fine; `start.sh` sends them before its READY gates. The API is already
    listening while they run, so keep clients away until `start.sh` reports READY. The source fix is open.
-4. **Long-context residency.** The KV pool is 595 usable blocks of 2,112 tokens, shared by the attention layers
+4. **Long-context residency.** The pool in the boot log (1,140,422 tokens on the shipping config) is vLLM's
+   estimate for maximum-length requests: 596 blocks of 2,112 tokens divided by the 137 blocks it counts for one
+   262,144-token request, times 262,144. Underneath, those blocks (595 usable) are shared by the attention layers
    and the GDN/SSM state: every request holds its attention blocks plus 9–12 state blocks. Nine ~116K-token
    sessions (prompt plus 4K generated) need 585–603 blocks, so about 8 fit at once, not 16; the 60-minute soak ran
-   9 and took its 157 preemptions there. 16 streams fit with short prompts: about 59K tokens each in steady decode,
+   9 and took its 157 preemptions there. 16 streams fit when each stays under about 59K tokens (steady decode), or
    53K while all 16 prefill.
 
 ## Status
@@ -201,15 +208,16 @@ it on a slower host.
 Serving.
 
 Two gate rows are recorded here honestly, from two different runs. The final full gate bundle (18:21Z boot)
-holds verdict **NOT PASSED (full)**: its `nan_sweep_concurrency` row ran 13/14, with the one miss at concurrency 3 —
-the documented KNOWN fill-12 `401` flip counted as a failure by a one-line counting bug in that gate harness's round
-loop (the flip itself is documented; the counting bug was left as-is and never hidden); `nan_sweep_strict` passed
-14/14 in the same bundle. Separately, a partial re-run (20:17Z boot) of the concurrency row failed on a different
-signature: at concurrency 14 the fill probe stopped after `17` (`17<eos>`), a wrong, truncated answer. That was its
-second sighting on the shipping config; the first was at 16:22Z the same day. It was accepted at cutover on an
-800-prompt early-stop test that reported no truncations at concurrency 14, but that test sent bare `a*b = `
-prompts rather than the fill probe and did not count 3-token replies, so it could not have seen this case. It is
-open.
+holds verdict **NOT PASSED (full)**. Its `nan_sweep_concurrency` row ran 13/14: at concurrency 3 the fill-12 probe
+answered `401`. The rule in force failed any round whose probe did not answer `391`. The KNOWN `12:401` entry and
+the round-loop change that would pass that round were both added after failures; under this project's rule that
+no gate rule is relaxed after a failure, neither is accepted, so the row stands as a failure. `nan_sweep_strict`
+passed 14/14 in the same bundle. Separately, a partial re-run (20:17Z boot) of the concurrency row failed on a
+different signature: at concurrency 14 the fill probe stopped after `17` (`17<eos>`), a wrong, truncated answer.
+That was its second sighting on the shipping config; the first was at 16:22Z the same day. It was accepted as a
+known risk at cutover. An 800-prompt early-stop test run after cutover reported no truncations at concurrency 14,
+but that test sent bare `a*b = ` prompts rather than the fill probe and did not count 3-token replies, so it could
+not have seen this case. It is open.
 
 | Milestone | State |
 |---|---|
@@ -226,8 +234,8 @@ Open:
 - the manual KV-bytes variant (1,695,325 tokens): measured and probe-checked, ships only after its own 60-minute
   soak;
 - the source fix for the capture leak behind the first-request guard;
-- replacing the near-tie fill probe with a non-near-tie one — its concurrency variant is a canary for fp8 batch
-  numerics, not a correctness gate;
+- replacing the fill-12 probe with one whose fp8 answer margin has been measured (fill 12's fp8 margin never was,
+  so calling it a near-tie is unproven);
 - the `17<eos>` truncation above;
 - the fp8/bf16 A/B on the shipping config (Known limits 1);
 - a first end-to-end launch by `start.sh` itself (see Quick start).
