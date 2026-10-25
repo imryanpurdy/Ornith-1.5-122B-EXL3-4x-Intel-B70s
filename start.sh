@@ -21,9 +21,11 @@
 # image 2 / video 0.
 #
 # WHY THE FIRST-REQUEST GUARD EXISTS (step 4): a cold FULL_DECODE_ONLY engine whose FIRST request is a long
-# prefill (>= 29K tokens) dies with EXL3XPU_OPEN_CAPTURE — a leaked SYCL command-graph recording left on the
-# worker queue by the capture phase. Three short requests first drain that queue, after which the first real
-# request can be any length. So: three "Say OK." requests, max_tokens 8, before anything else touches the API.
+# prefill dies with EXL3XPU_OPEN_CAPTURE — a command-graph recording left open on a worker queue after the
+# capture phase (what opens it is not identified). 29,008- and 60,147-token first requests both crashed; nothing
+# between a 25-token first request and 29,008 tokens was tested, so treat any long first request as unsafe.
+# Three short requests first leave the queue clean, after which the first real request can be any length.
+# So: three "Say OK." requests, max_tokens 8, before the READY gates (the API is already listening meanwhile).
 #
 # A guard failure tears the container down (it is not going to serve). A READY-gate failure leaves it up for
 # inspection and exits non-zero.
@@ -53,7 +55,7 @@ for arg in "$@"; do
   case "$arg" in
     start|stop|restart|status|logs) CMD="$arg" ;;
     --print) PRINT=true ;;
-    -h|--help) sed -n '2,29p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,31p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) err "unknown argument: $arg (try --help)" ;;
   esac
 done
@@ -310,7 +312,8 @@ print_plan() {
   echo "# 3. dist: $RUN_DIR/dist from xpu/exl3xpu + $BUILD_DIR/lib/*.so + templates/ + core/src/trellis_core"
   echo "# 4. docker run (below), then wait for /v1/models and 'Application startup complete'"
   echo "# 5. first-request guard: 3 x 'Say OK.' (max_tokens 8) — a cold FULL_DECODE_ONLY engine whose first"
-  echo "#    request is a >=29K-token prefill dies with EXL3XPU_OPEN_CAPTURE; three short requests drain the queue"
+  echo "#    request is a long prefill dies with EXL3XPU_OPEN_CAPTURE (29,008 and 60,147 tokens crashed; nothing"
+  echo "#    between 25 and 29,008 was tested); three short requests first leave the queue clean"
   echo "# 6. READY: nan sweep 14/14 (scripts/checks/nan_sweep.py) + tool calls (scripts/checks/toolcall.py)"
   echo
   print_cmd

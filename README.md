@@ -51,6 +51,11 @@ cp .env.example .env       # set MODEL_DIR to the weights and RUNTIME_IMAGE to t
 ./start.sh                 # builds _C.so/_moe.so on the first run (cached afterwards), launches, waits for READY
 ```
 
+**Not yet run end to end:** `start.sh`'s cold launch path (kernel build, dist, `docker run`, first-request guard,
+READY gates) has never launched an engine. The validated deployment was started by a separate launch script with
+the same image, serve arguments and container environment (`./start.sh --print` matches it argument for argument);
+of `start.sh` itself only `--print` and dry runs against a stand-in `docker` have been exercised.
+
 `scripts/build-vxk.sh` is a separate, once-only step: it builds the `vllm_xpu_kernels` overlay the engine cannot
 start without, needs network for its source and dependency clones, and caches its output in `$VXK_DIR`.
 
@@ -61,42 +66,51 @@ Later boots reuse `$BUILD_DIR` and `$VXK_DIR`.
 
 ## Measured
 
-Shipping config above, greedy, thinking off, 4x B70.
+Greedy, 4x B70. Every row runs the shipping config above (`--max-num-seqs 16`, MTP k=2) unless the row says
+otherwise. The 1-stream rows are chat requests; the 16- and 32-way rows send a raw prompt to `/v1/completions`,
+so the chat template's thinking switch does not apply to them.
 
 | workload | how it was measured | tok/s |
 |---|---|---:|
-| 1 stream | 20 requests, first discarded, median of 19, 200-token cap | 101.9 |
-| 1 stream | gate run, median of 19, 600-token cap | 112.6 |
+| 1 stream, thinking off | 20 requests, first discarded, median of 19, 200-token cap | 101.9 |
+| 1 stream, thinking on (the template's default) | gate run, 20 requests, first discarded, median of 19, 600-token cap | 112.6 |
 | 16 concurrent | sustained aggregate = mean of rounds 2–4, 600-token cap per stream | 457.7 |
-| 16 concurrent | gate run, median of 15 rounds | 454.8 |
-| 32 concurrent | gate run, median of 15 rounds (informational, not a gate) | 448.8 |
-| 1 stream, no MTP | as row 1 | 74.0 |
-| 16 concurrent, no MTP | as row 3 | 430.6 |
+| 16 concurrent | gate run, 15 rounds, median of rounds 2–15 | 454.8 |
+| 32 concurrent | gate run, 15 rounds, median of rounds 2–15 (informational, not a gate) | 448.8 |
+| 1 stream, no MTP, thinking off | as row 1 (74.0 at `--max-num-seqs` 16 and at 32) | 74.0 |
+| 16 concurrent, no MTP, `--max-num-seqs 32` | as row 3 | 430.6 |
+| 16 concurrent, MTP k=2, `--max-num-seqs 32` | as row 3: the same-`--max-num-seqs` reference for the row above | 447.9 |
 
 KV pool, and the same pool as a multiple of the 407,455 tokens the previous production engine held:
 
 | config | pool tokens | × |
 |---|---:|---:|
-| fp8 @ 0.85, MTP k=2 (shipping) | 1,140,422 | 2.80 |
-| fp8 @ 0.85, no MTP | 1,420,780 | 3.49 |
-| fp8 @ manual 11.61 GiB, MTP k=2 (measured, not shipped) | 1,695,325 | 4.16 |
+| fp8 @ 0.85, MTP k=2, `--max-num-seqs 16` (shipping) | 1,140,422 | 2.80 |
+| fp8 @ 0.85, MTP k=2, `--max-num-seqs 32` | 1,138,508 | 2.79 |
+| fp8 @ 0.85, no MTP, `--max-num-seqs 32` | 1,420,780 | 3.49 |
+| fp8 @ manual 11.61 GiB, MTP k=2, `--max-num-seqs 16` (measured, not shipped) | 1,695,325 | 4.16 |
 
 60-minute soak: 9 streams × ~116K-token prompts (measured mean 116,410), 9/9 completed, 0 errors, mean KV 94.2% over the steady window
-(min 81.3%, max 99.8%), 157 preemptions all at 97–100% KV, 0 OOM, VRAM drift ≤ 0.01 MiB per card.
+(min 81.3%, max 99.8%), 157 preemptions, 0 OOM, VRAM drift ≤ 0.01 MiB per card. The preemptions fell in six
+20-second sampler intervals, 124 of them in one; the KV samples on either side of those intervals read 88.9–99.5%.
+Nine such streams sit right at the pool's limit (Known limits 4). At that load each stream decoded at 1.7–3.7 tok/s
+(completion tokens over decode time), time to first token was 93–1,042 s, and the longest stall inside one stream
+was 536 s (a preemption recompute).
 
 Long context: needle-in-a-haystack correct at 131,457 and 205,322 prompt tokens (TTFT 101.7 s and 174.4 s), an
 118K-token prefix-cache scan with no drift beyond the limit, and image input all pass.
 
 Greedy decode here is not bit-deterministic across batch sizes: the same prompt at a different concurrency can
-produce a different, equally valid answer. That is why the numbers above are medians and sustained means, not
-single runs.
+produce a different answer, usually an equally valid one (Known limits 1 lists the known exceptions). That is why
+the numbers above are medians and sustained means, not single runs.
 
 ## How to test it
 
 `./start.sh` runs the READY checks before it reports success:
 
-- a 14-fill greedy arithmetic sweep (the `17*23 = 391` family) from 33 to 33,634 prompt tokens, with the four
-  documented fp8 flip fills (3, 12, 75, 150) passed as known answers, so a clean engine reads 14/14;
+- a 14-fill greedy arithmetic sweep (the `17*23 = 391` family) from 33 to 33,634 prompt tokens, with `401` at the
+  four documented flip fills (3, 12, 75, 150; see Known limits 1) passed as a known answer, so a clean engine reads
+  14/14;
 - a tool-call probe: 5 single-tool calls, one multi-tool pick, one nested-argument call.
 
 Then, from any client:
@@ -124,22 +138,43 @@ nothing). Boots poll `/v1/models` for up to `READY_WAIT_SECONDS` (default 1800 s
 
 ## Known limits
 
-1. **fp8 KV near-tie flips.** Greedy answers on knife-edge prompts can differ from bf16 KV. The documented family
-   is the `17*23 = 391` fill task, where fills 3, 12, 75 and 150 answer `401` — deterministic, well-formed, finite
-   logprobs. The known-flip list is frozen and handed to the READY sweep; the flips are accepted and documented,
-   not fixed. A paired A/B (recall at 60K/118K/200K, 220 short checkable prompts, tool calls) put fp8 within noise
-   of bf16 on every set; on the short A/B set fp8 scored 219/220 against bf16's 220/220 — one fp8-only miss, judged
-   within noise by the frozen rule.
-2. **MTP draft-KV cost.** The 2-token draft layer reserves its own KV: 1,140,422 tokens against 1,420,780 on the
-   identical config without MTP — 280,358 tokens, 19.7% of the no-MTP pool. It buys ~1.4× single-stream and ~1.06×
-   at 16 streams.
+1. **Answer flips on the fill probe.** Greedy answers on some prompts differ between fp8 and bf16 KV, and between
+   batch sizes. The documented family is the `17*23 = 391` fill task. Fill 3 (with fp8 KV) and fill 75 (with bf16
+   KV) have flipped every time so far; fills 12 and 150 flip intermittently:
+   - fill 3 answers `401` with fp8 KV in every sweep on the shipping config so far (15 of 15), and `391` with bf16;
+   - fill 12 answers `391` when it runs alone (34 of 34), but in 84 batched rounds it answered `401` four times and
+     stopped after `17` twice (see Status);
+   - fill 75 answers `401` with bf16 KV only (9 of 9 bf16 sweeps); with fp8 it has answered `391` every time (16 of 16);
+   - fill 150 answered `401` once in 15 sweeps.
+
+   The `401` answers are well-formed, with finite logprobs. The READY sweep accepts `401` at these four fills as a
+   known answer; the flips are documented, not fixed. A paired A/B (recall at 60K/118K/200K, 220 short checkable
+   prompts, tool calls) put fp8 within noise of bf16 on every set; on the short A/B set fp8 scored 219/220 against
+   bf16's 220/220 — one fp8-only miss, judged within noise by the frozen rule. That A/B ran on the no-MTP build at
+   `--max-num-seqs 32`, greedy, one request at a time, with thinking on, and it did not include the thinking-off
+   fill-3 case above. It has not yet been repeated on the shipping config (MTP k=2, `--max-num-seqs 16`); that
+   re-run is scheduled.
+2. **MTP draft-KV cost.** The 2-token draft layer reserves its own KV: about 282K tokens, ~19.9% of the no-MTP
+   pool, compared at the same `--max-num-seqs`:
+   - at 16: 282,359 tokens (19.85%), the shipping 1,140,422 against a no-MTP reading whose boot log was not kept;
+   - at 32: 282,272 tokens (19.87%), 1,138,508 against 1,420,780, both from boot logs.
+
+   It buys ~1.4× single-stream (101.9 against 74.0 tok/s) and ~1.04× at 16 streams (447.9 against 430.6, both at
+   `--max-num-seqs 32`; no-MTP 16-way at `--max-num-seqs 16` was not measured).
 3. **The first-request guard.** A cold FULL_DECODE_ONLY engine dies with `EXL3XPU_OPEN_CAPTURE` if its first
-   request is a long prefill (≥29K tokens; 29K and 60K both reproduce): a SYCL/oneMKL command-graph recording is
-   left open at the first unwarmed GEMM shape. Three short requests first leave the queue clean and everything
-   after that is fine; `start.sh` does this as part of READY. The source fix is open.
-4. **Long-context residency.** The pool holds about 9 concurrent ~116K-token sessions, not 16: on this hybrid
-   model the GDN/SSM state cache, not the attention pool, caps residency at 9. 16 streams is reachable with short
-   prompts.
+   request is a long prefill: an XPU command-graph recording is left open on a worker's queue after the warmup
+   captures, and the plugin's graph guard then stops the engine. First requests of 29,008 and 60,147 tokens both
+   crashed (measured before MTP was enabled). Nothing between a 25-token first request and 29,008 tokens was
+   tested, so the real threshold is unknown: treat any long first request as unsafe. What opens the recording is
+   not identified. An earlier oneMKL explanation was ruled out (torch-xpu's fp16 matmul runs on oneDNN, not
+   oneMKL), and the source of the leak is unproven. Three short requests first leave the queue clean, and every
+   long request after that has been fine; `start.sh` sends them before its READY gates. The API is already
+   listening while they run, so keep clients away until `start.sh` reports READY. The source fix is open.
+4. **Long-context residency.** The KV pool is 595 usable blocks of 2,112 tokens, shared by the attention layers
+   and the GDN/SSM state: every request holds its attention blocks plus 9–12 state blocks. Nine ~116K-token
+   sessions (prompt plus 4K generated) need 585–603 blocks, so about 8 fit at once, not 16; the 60-minute soak ran
+   9 and took its 157 preemptions there. 16 streams fit with short prompts: about 59K tokens each in steady decode,
+   53K while all 16 prefill.
 
 ## Status
 
@@ -149,9 +184,12 @@ Two gate rows are recorded here honestly, from two different runs. The final ful
 holds verdict **NOT PASSED (full)**: its `nan_sweep_concurrency` row ran 13/14, with the one miss at concurrency 3 —
 the documented KNOWN fill-12 `401` flip counted as a failure by a one-line counting bug in that gate harness's round
 loop (the flip itself is documented; the counting bug was left as-is and never hidden); `nan_sweep_strict` passed
-14/14 in the same bundle. Separately, a partial re-run (20:17Z boot) of the concurrency row showed a different
-signature: the knife-edge fill probe truncated to `17<eos>` at concurrency 14. That near-tie truncation was accepted
-at cutover after 800 real fill prompts showed zero truncations at concurrency 14.
+14/14 in the same bundle. Separately, a partial re-run (20:17Z boot) of the concurrency row failed on a different
+signature: at concurrency 14 the fill probe stopped after `17` (`17<eos>`), a wrong, truncated answer. That was its
+second sighting on the shipping config; the first was at 16:22Z the same day. It was accepted at cutover on an
+800-prompt early-stop test that reported no truncations at concurrency 14, but that test sent bare `a*b = `
+prompts rather than the fill probe and did not count 3-token replies, so it could not have seen this case. It is
+open.
 
 | Milestone | State |
 |---|---|
@@ -169,7 +207,10 @@ Open:
   soak;
 - the source fix for the capture leak behind the first-request guard;
 - replacing the near-tie fill probe with a non-near-tie one — its concurrency variant is a canary for fp8 batch
-  numerics, not a correctness gate.
+  numerics, not a correctness gate;
+- the `17<eos>` truncation above;
+- the fp8/bf16 A/B on the shipping config (Known limits 1);
+- a first end-to-end launch by `start.sh` itself (see Quick start).
 
 Details: [docs/STATUS.md](docs/STATUS.md).
 
@@ -177,6 +218,8 @@ Details: [docs/STATUS.md](docs/STATUS.md).
 
 - [trellis-serve](https://github.com/sybil-solutions/trellis-serve) (MIT): the B70 EXL3 kernels, the vLLM and
   SGLang plugins and the split rules this builds on. Its `LICENSE` and `NOTICE` are kept unchanged.
+- [ornith-ai](https://huggingface.co/ornith-ai): the Ornith-1.5-122B base model, and the chat template that
+  `templates/ornith-chat-template.jinja` is adapted from (MIT, as declared on the model card).
 - [Mia-AiLab](https://huggingface.co/Mia-AiLab): the EXL3 quantization recipe and the weights served here.
 - [exllamav3](https://github.com/turboderp-org/exllamav3): the EXL3 format, the reference reconstruction and the
   tensor-parallel layouts.

@@ -32,7 +32,7 @@
 - Batched decode (3–32 rows): K=5 is 1.40–1.91x K=4 and slower than K=6. The K=5 DPAS path decodes 8 lanes x 32 steps, without K=4's 32-lane builder.
 - Prefill: K=5 is within 3–11 %.
 
-The 5-bit tensors are ~54 % of the weight bytes read per decoded token, so this is the first kernel fix (in progress), together with routing 5-bit batches of 3–8 rows to the single-row kernel and shape-aware split-K for narrow tensors.
+The 5-bit tensors are ~54 % of the weight bytes read per decoded token, so this was the first kernel fix, together with routing 5-bit batches of 3–8 rows to the single-row kernel and shape-aware split-K for narrow tensors. All three landed in milestone 1c below.
 
 ## Milestone 1c: dense kernels for Ornith's shapes (done)
 
