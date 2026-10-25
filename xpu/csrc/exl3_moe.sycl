@@ -781,8 +781,10 @@ void moe_set_mr(int64_t mr) {
 // raises). It includes the moe_set_mr / moe_set_splits overrides, which must be valid for the shape, else the plan
 // is empty. Defaults:
 //   K=3: MR 1 (pair mode, M <= 4) / 2 (M <= 64) / 4; gate|up P 5; down P 10 at M = 1, else 5 (the Flash-Next picks)
-//   K=4: MR as K=3; gate|up P 12 (pair mode) / 6 (M <= 64) / 4; down P = clamp((I/16)/8, 4, 16): 8 at I=1024,
-//        4 at I=512 and 256. Starting points: the M2 microbench picks the final ones.
+//   K=4: MR 1 (pair mode, M <= 4) / 4; gate|up P 12 (pair mode) / 8 (M <= 64) / 4; down P 4 (grouped M <= 64), else
+//        clamp((I/16)/8, 4, 16): 8 at I=1024, 4 at I=512 and 256. Decode (5 <= M <= 64) from the 2026-10-25 replay of
+//        live 16-way MTP routing on EP4 (M=48, 2.2-3.1 rows per expert): MR 4 / 8 / 4 beat MR 2 / 6 / 8 by 6-17 %
+//        per layer; MR does not change a row's result (outputs bit-identical).
 // A default that does not fit the shape (or a reported work-group limit) falls back to the nearest valid compiled
 // P (ties: the larger one), then to a smaller MR. K=3 at M >= prefill_min_m runs the DPAS prefill instead.
 struct MoePlan { int MR = 0, gu = 0, dn = 0, RB = 0; };
@@ -805,9 +807,10 @@ static MoePlan moe_plan_impl(int H, int I, int K, int M) {
     const bool pair = M <= g_pair_max_m;
     int gu0, dn0;
     if (K == 3) { gu0 = 5; dn0 = M <= 1 ? 10 : 5; }
-    else { gu0 = pair ? 12 : (M <= 64 ? 6 : 4); dn0 = std::min(16, std::max(4, (I / 16) / 8)); }
+    else if (!pair && M <= 64) { gu0 = 8; dn0 = 4; }     // decode, grouped: MR 4, gate|up P 8, down P 4 (below)
+    else { gu0 = pair ? 12 : 4; dn0 = std::min(16, std::max(4, (I / 16) / 8)); }
     const bool mr_fixed = pair || g_mr_override > 0;
-    const int mr_first = pair ? 1 : (g_mr_override > 0 ? g_mr_override : (M <= 64 ? 2 : 4));
+    const int mr_first = pair ? 1 : (g_mr_override > 0 ? g_mr_override : (K == 3 && M <= 64 ? 2 : 4));
     for (int MR = mr_first; MR >= 1; MR /= 2) {
         int gu = g_gu_p > 0 ? (moe_gu_ok(H, K, MR, g_gu_p) ? g_gu_p : 0)
                             : (moe_gu_ok(H, K, MR, gu0) ? gu0 : moe_nearest_p(0, H, K, MR, gu0));
