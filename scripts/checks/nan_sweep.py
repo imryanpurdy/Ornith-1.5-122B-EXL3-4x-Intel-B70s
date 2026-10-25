@@ -7,11 +7,13 @@ question. A row fails when:
   - the content's final integer is not exactly the product ('17*23 = 391' passes; '4010', '1391' do not),
   - the reply stopped (finish_reason 'stop') with fewer completion tokens than the product's digits plus the EOS
     token (SHORT_STOP: e.g. '17' + EOS = 3 tokens where 391 needs 4); never exempted,
+  - the reply ran into the 16-token cap without stopping (finish_reason 'length'),
   - the text is degenerate (one token repeated 8+ times, or 'ductduct'),
   - a sampled logprob is not finite (or is vLLM's -9999 floor), or on an HTTP error.
 KNOWN lists fills whose documented answer differs from the product on this exact build with fp8 KV. Only that
 exact full answer (content == '401') is reported as a WARNING instead of a failure, never a substring. Fill 3
-(76 prompt tokens) answers 401 in every recorded fp8 sweep. No entry is added because a run failed.
+(76 prompt tokens) answers 401 in every fp8 sweep run on its own (it has also answered 391 under load). That entry
+was itself added after a failure and is kept only by an explicit ruling; no entry is added because a run failed.
 
 Usage: nan_sweep.py --port 8022 [--model ornith-1.5-122b-exl3] [--host 127.0.0.1]
 Exit: 0 when every row passes, 1 otherwise.
@@ -57,7 +59,7 @@ def degenerate(text):
 
 def final_int(content):
     """The answer's last integer, thousands commas removed; None if there is none."""
-    m = re.findall(r"\d+(?:,\d{3})*", content)
+    m = re.findall(r"-?\d+(?:,\d{3})*", content)
     return m[-1].replace(",", "") if m else None
 
 
@@ -93,11 +95,13 @@ def main():
         ct = r["completion_tokens"]
         if r["finish_reason"] == "stop" and isinstance(ct, int) and ct < needed:
             hard.append(f"SHORT_STOP {ct} completion tokens < {needed}")
+        if r["finish_reason"] == "length":
+            hard.append(f"hit max_tokens {MAX_TOKENS} without stopping")
         text = r["reasoning"] + "|" + r["content"]
         note = ""
         if final_int(r["content"]) == product:
             pass
-        elif KNOWN.get(n) is not None and r["content"].strip() == KNOWN[n]:
+        elif KNOWN.get(n) is not None and r["content"] == KNOWN[n]:
             note = f"  [WARNING: KNOWN fill={n} answers exactly {KNOWN[n]}, not {product} (documented)]"
         else:
             hard.append(f"answer {final_int(r['content'])!r} is not {product}")
