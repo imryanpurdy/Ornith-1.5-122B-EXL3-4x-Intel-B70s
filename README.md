@@ -74,10 +74,10 @@ so the chat template's thinking switch does not apply to them.
 | workload | how it was measured | tok/s |
 |---|---|---:|
 | 1 stream, thinking off | 20 requests, first discarded, median of 19, 200-token cap | 101.9 |
-| 1 stream, thinking on (the template's default) | gate run, 20 requests, first discarded, median of 19, 600-token cap | 112.6 |
+| 1 stream, thinking on (the template's default) | gate run (18:21Z boot), 20 requests, first discarded, median of 19, 600-token cap; 112.7 on the live engine | 112.6 |
 | 16 concurrent | sustained aggregate = mean of rounds 2–4, 600-token cap per stream | 457.7 |
-| 16 concurrent | gate run, 15 rounds, median of rounds 2–15 | 454.8 |
-| 32 concurrent | gate run, 15 rounds, median of rounds 2–15 (informational, not a gate) | 448.8 |
+| 16 concurrent | gate run (18:21Z boot), 15 rounds, median of rounds 2–15; 454.9 on the live engine | 454.8 |
+| 32 concurrent | gate run (18:21Z boot), 15 rounds, median of rounds 2–15 (informational, not a gate); 449.1 on the live engine | 448.8 |
 | 1 stream, no MTP, thinking off | as row 1 (74.0 at `--max-num-seqs` 16 and at 32) | 74.0 |
 | 16 concurrent, no MTP, `--max-num-seqs 32` | as row 3 | 430.6 |
 | 16 concurrent, MTP k=2, `--max-num-seqs 32` | as row 3: the same-`--max-num-seqs` reference for the row above | 447.9 |
@@ -91,14 +91,14 @@ KV pool, and the same pool as a multiple of the 407,455 tokens the previous prod
 | fp8 @ 0.85, no MTP, `--max-num-seqs 32` | 1,420,780 | 3.49 |
 | fp8 @ manual 11.61 GiB, MTP k=2, `--max-num-seqs 16` (measured, not shipped) | 1,695,325 | 4.16 |
 
-60-minute soak: 9 streams × ~116K-token prompts (measured mean 116,410), 9/9 completed, 0 errors, mean KV 94.2% over the steady window
+60-minute capacity soak (not the gate soak in Status, which ran different checks): 9 streams × ~116K-token prompts (measured mean 116,410), 9/9 completed, 0 errors, mean KV 94.2% over the steady window
 (min 81.3%, max 99.8%), 157 preemptions, 0 OOM, VRAM drift ≤ 0.01 MiB per card. The preemptions fell in six
 20-second sampler intervals, 124 of them in one; the KV samples on either side of those intervals read 88.9–99.5%.
 Nine such streams sit right at the pool's limit (Known limits 4). At that load each stream decoded at 1.7–3.7 tok/s
 (completion tokens over decode time), time to first token was 93–1,042 s, and the longest stall inside one stream
 was 536 s (a preemption recompute).
 
-Long context: needle-in-a-haystack correct at 131,457 and 205,322 prompt tokens (TTFT 101.7 s and 174.4 s), an
+Long context: needle-in-a-haystack correct at 131,457 and 205,322 prompt tokens (TTFT 101.7 s and 174.4 s on the 18:21Z boot; 102.1 s and 174.4 s on the live engine), an
 118K-token prefix-cache scan with no drift beyond the limit, and image input all pass.
 
 Greedy decode here is not bit-deterministic across batch sizes: the same prompt at a different concurrency can
@@ -111,8 +111,8 @@ the numbers above are medians and sustained means, not single runs.
 
 - a 15-fill greedy arithmetic sweep (the `17*23 = 391` family) from 33 to 33,634 prompt tokens. Each answer's final
   integer must be exactly 391. A reply that stops before the answer can be complete (fewer completion tokens than
-  the digits plus EOS) fails. Degenerate text fails. The one exemption is fill 3 (76 tokens), which answers `401` in
-  every recorded fp8 sweep: only that exact full answer is accepted there (see Known limits 1). A clean engine
+  the digits plus EOS) fails, and so does one that runs into the 16-token cap. Degenerate text fails. The one exemption is fill 3 (76 tokens), which answers `401` in
+  every fp8 sweep run on its own (16 of 16; under load it has also answered `391`): only that exact full answer is accepted there (see Known limits 1). A clean engine
   reads 15/15;
 - a tool-call probe: 5 single-tool calls, one multi-tool pick, one nested-argument call.
 
@@ -163,18 +163,23 @@ it on a slower host.
 
 1. **Answer flips on the fill probe.** Greedy answers on some prompts differ between fp8 and bf16 KV, and between
    batch sizes. The documented family is the `17*23 = 391` fill task. Fill 3 (with fp8 KV) and fill 75 (with bf16
-   KV) have flipped every time so far; fills 12 and 150 flip intermittently:
-   - fill 3 answers `401` with fp8 KV in every sweep on the shipping config so far (15 of 15), and `391` with bf16
+   KV) have flipped in every sweep run on its own so far; fills 12 and 150 flip intermittently:
+   - fill 3 answers `401` with fp8 KV in every sweep run on its own on the shipping config so far (16 of 16), but
+     under the 60-minute soak's load it answered `391` in 4 of 6 sweeps and `401` in 2; it answers `391` with bf16
      on the current build (4 of 4 bf16 sweeps; the one bf16 `401`, in 9 bf16 sweeps, came from an earlier build
      with a since-fixed oneDNN GEMM nondeterminism at 65–128-token prompts);
-   - fill 12 answers `391` when it runs alone (34 of 34), but in 84 batched rounds it answered `401` four times and
+   - fill 12 answers `391` when it runs alone (35 of 35), but in 98 batched rounds it answered `401` four times and
      stopped after `17` twice (see Status);
-   - fill 75 answers `401` with bf16 KV only (9 of 9 bf16 sweeps); with fp8 it has answered `391` every time (16 of 16);
-   - fill 150 answered `401` once in 15 sweeps.
+   - fill 75 answers `401` with bf16 KV only (9 of 9 bf16 sweeps); with fp8 it has answered `391` every time (23 of 23);
+   - fill 150 answered `401` once in 22 sweeps;
+   - under the soak's load (12 streams), fill 5 answered `401` once and fill 40 answered `491` twice and `401` once,
+     in 6 sweeps each; both answer `391` when they run on their own;
+   - fill 6 (not a gate fill) answered `401` in 3 of 3 runs on its own with fp8 KV.
 
    The `401` answers are well-formed, with finite logprobs; the flips are documented, not fixed. The READY sweep
-   accepts `401` only at fill 3, and only as the exact full answer (never a substring). The earlier entries for
-   fills 12, 75 and 150 were each added after the failure they exempted, and have been dropped. A reply that stops
+   accepts `401` only at fill 3, and only as the exact full answer (never a substring). Every entry, fill 3's
+   included, was added after the failure it exempted; fill 3's is kept only by an explicit ruling of the project
+   owner, as an exact match, and the entries for fills 12, 75 and 150 have been dropped. A reply that stops
    before its answer could be complete (fewer completion tokens than the answer's digits plus EOS, the `17<eos>`
    case) always fails. No entry is added because a run failed (see Status). A paired A/B (recall at 60K/118K/200K, 220 short
    checkable prompts, tool calls) put fp8 within noise of bf16 on every set; on the short A/B set fp8 scored
@@ -202,15 +207,43 @@ it on a slower host.
    estimate for maximum-length requests: 596 blocks of 2,112 tokens divided by the 137 blocks it counts for one
    262,144-token request, times 262,144. Underneath, those blocks (595 usable) are shared by the attention layers
    and the GDN/SSM state: every request holds its attention blocks plus 9–12 state blocks. Nine ~116K-token
-   sessions (prompt plus 4K generated) need 585–603 blocks, so about 8 fit at once, not 16; the 60-minute soak ran
+   sessions (prompt plus 4K generated) need 585–603 blocks, so about 8 fit at once, not 16; the 60-minute capacity soak ran
    9 and took its 157 preemptions there. 16 streams fit when each stays under about 59K tokens (steady decode), or
    53K while all 16 prefill.
 
 ## Status
 
-Serving.
+Serving. Milestone 5 is not met: the 60-minute gate soak fails two of its rows, and one row of the live gate run
+passes only under a rule change made after an earlier failure.
 
-Two gate rows are recorded here honestly, from two different runs. The final full gate bundle (18:21Z boot)
+**Gate run on the live engine** (the serving container itself, no restart, the shipping config): every gate row
+passed under the gate code as it ran, but `nan_sweep_concurrency` passes only under the post-failure rule
+change described below (11/14 under the original rule), so it is not counted as a pass until that change is ruled
+on. KV pool 1,140,422 tokens; `nan_sweep_strict` 15/15 (fill 3 answered `401`, its one documented exception);
+`nan_sweep_concurrency` 14/14; the 118K prefix-cache scan; needles at 131,457 and 205,322 prompt tokens; tool calls
+5/5; thinking on/off checks 23/23; 1 stream 112.7 tok/s (floor 36.8); 16 concurrent 454.9 tok/s (median of rounds
+2–15) against a floor of 435 tok/s. The 16-way floor was 457 (70% of the previous production engine's 652.9) until
+the project owner re-based it to 435 after a 447.9 tok/s measurement at `--max-num-seqs 32` missed it; that change
+also came after a failure, and 454.9 is below the original 457. Under the
+concurrency row's original rule (every probe token-identical to the solo probe), 3 of its 14 rounds (c=4, 8 and 14)
+would not pass; the rule was later changed to report token differences without failing, and that change came after
+a failure, so it is listed here.
+
+**60-minute gate soak** (`soak60`: 12 streams of load, needle and prefix-resend lookups, and the fill sweep every 10
+minutes): **failed two rows**.
+- Prefix-resend lookups at 21–23K tokens (a 1,300-row item/code table, ask for one item's code): 265 of 270 right.
+  The 5 wrong answers were each the code of a different row of the same table (one or two rows away in three of
+  them), not garbage; one request and its exact resend gave the same wrong code.
+- The fill sweep under load: 2 of 6 sweeps clean. Fill 5 answered `401` once and fill 40 answered `491` twice and
+  `401` once; both answer `391` on their own. No truncation, no non-finite logprobs, no degenerate text.
+- Every other row passed: the same container throughout, 180/180 load requests clean, 44/44 needles at 64K, 0
+  engine or kernel resets, 0 graph captures after warmup, 0 pages swapped out.
+
+Whether these two rows fail because of fp8 KV or because of the model and engine at this load is not measured yet:
+no bf16-KV run has had this soak. This is the first run of this soak; the earlier 60-minute soak (Measured) was a
+capacity test that ran neither check.
+
+Two earlier gate rows are recorded here honestly, from two different runs. The final full gate bundle (18:21Z boot)
 holds verdict **NOT PASSED (full)**. Its `nan_sweep_concurrency` row ran 13/14: at concurrency 3 the fill-12 probe
 answered `401`. The rule in force failed any round whose probe did not answer `391`. The KNOWN `12:401` entry and
 the round-loop change that would pass that round were both added after failures; under this project's rule that
@@ -230,10 +263,11 @@ not have seen this case. It is open.
 | 2. EXL3 MoE method in vLLM matches the reference on one card | done |
 | 3. Two cards match one card | done |
 | 4. Ornith on four cards boots and answers | done |
-| 5. Long-context recall, tool calls, throughput and a 60-minute soak | done |
+| 5. Long-context recall, tool calls, throughput and a 60-minute soak | not done: the 60-minute gate soak fails two rows, and `nan_sweep_concurrency` passes only under a post-failure rule change (above) |
 
 Open:
 
+- the two failed soak rows above: wrong table lookups at ~22K tokens and fill-probe flips, both under load;
 - the manual KV-bytes variant (1,695,325 tokens): measured and probe-checked, ships only after its own 60-minute
   soak;
 - the source fix for the capture leak behind the first-request guard;
