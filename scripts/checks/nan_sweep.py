@@ -7,7 +7,8 @@ question. A row fails when:
   - the content's final integer is not exactly the product ('17*23 = 391' passes; '4010', '1391' do not),
   - the reply stopped (finish_reason 'stop') with fewer completion tokens than the product's digits plus the EOS
     token (SHORT_STOP: e.g. '17' + EOS = 3 tokens where 391 needs 4); never exempted,
-  - the reply ran into the 16-token cap without stopping (finish_reason 'length'),
+  - the reply ran into the 16-token cap without stopping (finish_reason 'length'), or ended with any finish_reason
+    other than 'stop',
   - the text is degenerate (one token repeated 8+ times, or 'ductduct'),
   - a sampled logprob is not finite (or is vLLM's -9999 floor), or on an HTTP error.
 KNOWN lists fills whose documented answer differs from the product on this exact build with fp8 KV. Only that
@@ -59,8 +60,8 @@ def degenerate(text):
 
 def final_int(content):
     """The answer's last integer, thousands commas removed; None if there is none."""
-    m = re.findall(r"-?\d+(?:,\d{3})*", content)
-    return m[-1].replace(",", "") if m else None
+    m = re.findall(r"[-\u2212]?\d+(?:,\d{3})*", content)
+    return m[-1].replace(",", "").replace("\u2212", "-") if m else None
 
 
 def main():
@@ -97,6 +98,8 @@ def main():
             hard.append(f"SHORT_STOP {ct} completion tokens < {needed}")
         if r["finish_reason"] == "length":
             hard.append(f"hit max_tokens {MAX_TOKENS} without stopping")
+        elif r["finish_reason"] != "stop":
+            hard.append(f"finish_reason {r['finish_reason']!r} is not 'stop'")
         text = r["reasoning"] + "|" + r["content"]
         note = ""
         if final_int(r["content"]) == product:
