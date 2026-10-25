@@ -109,9 +109,11 @@ the numbers above are medians and sustained means, not single runs.
 
 `./start.sh` runs the READY checks before it reports success:
 
-- a 14-fill greedy arithmetic sweep (the `17*23 = 391` family) from 33 to 33,634 prompt tokens, with `401` at the
-  four documented flip fills (3, 12, 75, 150; see Known limits 1) passed as a known answer, so a clean engine reads
-  14/14;
+- a 15-fill greedy arithmetic sweep (the `17*23 = 391` family) from 33 to 33,634 prompt tokens. Each answer's final
+  integer must be exactly 391. A reply that stops before the answer can be complete (fewer completion tokens than
+  the digits plus EOS) fails. Degenerate text fails. The one exemption is fill 3 (76 tokens), which answers `401` in
+  every recorded fp8 sweep: only that exact full answer is accepted there (see Known limits 1). A clean engine
+  reads 15/15;
 - a tool-call probe: 5 single-tool calls, one multi-tool pick, one nested-argument call.
 
 Then, from any client:
@@ -170,10 +172,11 @@ it on a slower host.
    - fill 75 answers `401` with bf16 KV only (9 of 9 bf16 sweeps); with fp8 it has answered `391` every time (16 of 16);
    - fill 150 answered `401` once in 15 sweeps.
 
-   The `401` answers are well-formed, with finite logprobs. The READY sweep accepts `401` at these four fills as a
-   known answer; the flips are documented, not fixed. Each of those four entries was added after the failure it
-   exempts, and the sweep matches the known answer as a substring rather than exactly; both are under review, and
-   neither turns a recorded gate failure into a pass (see Status). A paired A/B (recall at 60K/118K/200K, 220 short
+   The `401` answers are well-formed, with finite logprobs; the flips are documented, not fixed. The READY sweep
+   accepts `401` only at fill 3, and only as the exact full answer (never a substring). The earlier entries for
+   fills 12, 75 and 150 were each added after the failure they exempted, and have been dropped. A reply that stops
+   before its answer could be complete (fewer completion tokens than the answer's digits plus EOS, the `17<eos>`
+   case) always fails. No entry is added because a run failed (see Status). A paired A/B (recall at 60K/118K/200K, 220 short
    checkable prompts, tool calls) put fp8 within noise of bf16 on every set; on the short A/B set fp8 scored
    219/220 against bf16's 220/220 — one fp8-only miss, judged within noise by the frozen rule. That A/B ran on the
    no-MTP build at `--max-num-seqs 32`, greedy, one request at a time, with thinking on, and it did not include the

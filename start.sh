@@ -454,7 +454,7 @@ print_plan() {
   echo "# 5. first-request guard: 3 x 'Say OK.' (max_tokens 8) — a cold FULL_DECODE_ONLY engine whose first"
   echo "#    request is a long prefill dies with EXL3XPU_OPEN_CAPTURE (29,008 and 60,147 tokens crashed; nothing"
   echo "#    between 25 and 29,008 was tested); three short requests first leave the queue clean"
-  echo "# 6. READY: nan sweep 14/14 (scripts/checks/nan_sweep.py) + tool calls (scripts/checks/toolcall.py)"
+  echo "# 6. READY: nan sweep 15/15 (scripts/checks/nan_sweep.py) + tool calls (scripts/checks/toolcall.py)"
   echo
   print_cmd
 }
