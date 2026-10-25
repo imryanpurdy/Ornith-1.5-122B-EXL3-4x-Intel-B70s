@@ -118,8 +118,8 @@ def main():
                     fail(f"chunk {c} of M={M} at {(H, I, K)} has no plan")
         # K=4 starting defaults (DESIGN 3.1 item 2)
         dn0 = min(16, max(4, (I // 16) // 8))
-        for M, want in ((1, (1, 12, dn0)), (4, (1, 12, dn0)), (5, (2, 6, dn0)), (64, (2, 6, dn0)), (65, (4, 4, dn0)),
-                        (1024, (4, 4, dn0)), (4096, (4, 4, dn0))):
+        for M, want in ((1, (1, 12, dn0)), (4, (1, 12, dn0)), (5, (4, 8, 4)), (48, (4, 8, 4)), (64, (4, 8, 4)),
+                        (65, (4, 4, dn0)), (1024, (4, 4, dn0)), (4096, (4, 4, dn0))):
             if plan(H, I, K, M)[:3] != want:
                 fail(f"default moe_plan{(H, I, K, M)} = {plan(H, I, K, M)}, want {want}")
         summary[f"{H},{I},{K}"] = [{"plan": list(p), "M": r} for p, r in sorted(seen.items(), key=lambda kv: kv[1][0])]
