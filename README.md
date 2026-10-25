@@ -18,13 +18,13 @@ The shipping configuration, on four Arc Pro B70 cards, one rank per card:
 | | |
 |---|---|
 | parallelism | tensor parallel 4 + expert parallel (whole experts: 64 of 256 per card) |
-| context | `--max-model-len 262144` (256K), paged KV in 2,112-token blocks |
+| context | `--max-model-len 262144` (256K), paged KV in 1,088-token blocks (2,112 with fp8 KV); prefix-cache hits at `--prefix-match-unit 64` |
 | speculation | MTP draft layer, `num_speculative_tokens 2` |
-| KV cache | `--kv-cache-dtype fp8_e4m3` for the attention layers (the GDN/SSM state stays bf16), `--gpu-memory-utilization 0.85` |
+| KV cache | bf16 for the attention layers and the GDN/SSM state, `--gpu-memory-utilization 0.92`. Why bf16: with fp8 KV, 5 of 20 short answers at 14 concurrent requests stopped after their first token and exact long-context lookups failed that bf16 answers. `KV_CACHE_DTYPE=fp8` restores `fp8_e4m3` (larger pool). |
 | graphs | `cudagraph_mode: FULL_DECODE_ONLY` inside `--compilation-config` (not a standalone flag), capture sizes 1,2,4,8,12,16,24,32,40,48,56,64,96 → 24 graphs per rank (9 target + 15 drafter). No graph is captured while serving; the plugin's graph guard raises if one is. |
 | batching | `--max-num-seqs 16`, `--max-num-batched-tokens 4096` |
 | API | auto tool choice with the `qwen3_xml` parser; `qwen3_effort` reasoning parser plus a chat template that turns reasoning off with an empty think block |
-| per card | 15.73 GiB of weights, 7.8 GiB of KV |
+| per card | 15.73 GiB of weights, 8.7 GiB of KV |
 
 ## Requirements
 
@@ -73,25 +73,18 @@ so the chat template's thinking switch does not apply to them.
 
 | workload | how it was measured | tok/s |
 |---|---|---:|
-| 1 stream, thinking off | 20 requests, first discarded, median of 19, 200-token cap | 101.9 |
-| 1 stream, thinking on (the template's default) | gate run (18:21Z boot), 20 requests, first discarded, median of 19, 600-token cap; 112.7 on the live engine | 112.6 |
-| 16 concurrent | sustained aggregate = mean of rounds 2–4, 600-token cap per stream | 457.7 |
-| 16 concurrent | gate run (18:21Z boot), 15 rounds, median of rounds 2–15; 454.9 on the live engine | 454.8 |
-| 32 concurrent | gate run (18:21Z boot), 15 rounds, median of rounds 2–15 (informational, not a gate); 449.1 on the live engine | 448.8 |
-| 1 stream, no MTP, thinking off | as row 1 (74.0 at `--max-num-seqs` 16 and at 32) | 74.0 |
-| 16 concurrent, no MTP, `--max-num-seqs 32` | as row 3 | 430.6 |
-| 16 concurrent, MTP k=2, `--max-num-seqs 32` | as row 3: the same-`--max-num-seqs` reference for the row above | 447.9 |
+| 1 stream | 20 requests, first discarded, median of 19, 600-token cap | 113.6 |
+| 4 concurrent | 15 rounds, median of rounds 2–15, 600-token cap per stream | 302 |
+| 16 live-shaped streams | 16 distinct 10–30K-token prompts (code, logs, docs), temperature 0.6, thinking on for half, 60-second steady window | 427 |
 
 KV pool, and the same pool as a multiple of the 407,455 tokens the previous production engine held:
 
 | config | pool tokens | × |
 |---|---:|---:|
-| fp8 @ 0.85, MTP k=2, `--max-num-seqs 16` (shipping) | 1,140,422 | 2.80 |
-| fp8 @ 0.85, MTP k=2, `--max-num-seqs 32` | 1,138,508 | 2.79 |
-| fp8 @ 0.85, no MTP, `--max-num-seqs 32` | 1,420,780 | 3.49 |
-| fp8 @ manual 11.61 GiB, MTP k=2, `--max-num-seqs 16` (measured, not shipped) | 1,695,325 | 4.16 |
+| bf16 @ 0.92, MTP k=2, `--max-num-seqs 16` (shipping) | 761,564 | 1.87 |
+| fp8 @ 0.85, MTP k=2, `--max-num-seqs 16` (`KV_CACHE_DTYPE=fp8`, `GPU_MEM_UTIL=0.85`) | 1,140,422 | 2.80 |
 
-60-minute capacity soak (not the gate soak in Status, which ran different checks): 9 streams × ~116K-token prompts (measured mean 116,410), 9/9 completed, 0 errors, mean KV 94.2% over the steady window
+60-minute capacity soak on the earlier fp8 @ 0.85 config (not the gate soak in Status, which ran different checks): 9 streams × ~116K-token prompts (measured mean 116,410), 9/9 completed, 0 errors, mean KV 94.2% over the steady window
 (min 81.3%, max 99.8%), 157 preemptions, 0 OOM, VRAM drift ≤ 0.01 MiB per card. The preemptions fell in six
 20-second sampler intervals, 124 of them in one; the KV samples on either side of those intervals read 88.9–99.5%.
 Nine such streams sit right at the pool's limit (Known limits 4). At that load each stream decoded at 1.7–3.7 tok/s

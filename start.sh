@@ -24,8 +24,9 @@
 #
 # Path: prereqs -> kernels (cached) -> plugin dist -> docker run -> first-request guard -> READY gates.
 #
-# The serve line is the measured operating point, not a starting point: TP4 + expert parallel, fp8_e4m3 KV,
-# gpu-memory-utilization 0.85, max-model-len 262144, max-num-batched-tokens 4096, max-num-seqs 16, MTP k=2,
+# The serve line is the measured operating point, not a starting point: TP4 + expert parallel, bf16 KV
+# (KV_CACHE_DTYPE=fp8 for fp8_e4m3), gpu-memory-utilization 0.92, prefix-match-unit 64, async scheduling,
+# shutdown-timeout 90, max-model-len 262144, max-num-batched-tokens 4096, max-num-seqs 16, MTP k=2,
 # FULL_DECODE_ONLY with capture sizes 1..96, qwen3_xml tool parser, qwen3_effort reasoning parser + plugin,
 # image 2 / video 0.
 #
@@ -82,7 +83,7 @@ fi
 set -a; . "./$ENV_FILE"; set +a
 
 for v in MODEL_DIR RUNTIME_IMAGE TOOLCHAIN_IMAGE BUILD_DIR PORT SERVED_MODEL_NAME GPUS \
-         GPU_MEM_UTIL MAX_NUM_SEQS MTP_K MAX_MODEL_LEN MAX_NUM_BATCHED_TOKENS; do
+         GPU_MEM_UTIL MAX_NUM_SEQS MTP_K MAX_MODEL_LEN MAX_NUM_BATCHED_TOKENS KV_CACHE_DTYPE SHUTDOWN_TIMEOUT; do
   [[ -n "${!v:-}" ]] || err ".env: $v is empty"
 done
 CONTAINER_NAME="${CONTAINER_NAME:-ornith-exl3}"
@@ -98,6 +99,11 @@ is_posint "$MAX_MODEL_LEN" || err "MAX_MODEL_LEN must be a positive integer (got
 [[ "$MAX_MODEL_LEN" -le 262144 ]] || err "MAX_MODEL_LEN=$MAX_MODEL_LEN exceeds the validated 262144"
 is_posint "$MAX_NUM_BATCHED_TOKENS" || err "MAX_NUM_BATCHED_TOKENS must be a positive integer"
 is_num "$MTP_K" && [[ "$MTP_K" =~ ^[0-9]+$ ]] || err "MTP_K must be an integer (got '$MTP_K')"
+[[ "$KV_CACHE_DTYPE" == bf16 || "$KV_CACHE_DTYPE" == fp8 ]] || err "KV_CACHE_DTYPE must be bf16 or fp8 (got '$KV_CACHE_DTYPE')"
+PREFIX_MATCH_UNIT="${PREFIX_MATCH_UNIT:-}"
+[[ -z "$PREFIX_MATCH_UNIT" ]] || { [[ "$PREFIX_MATCH_UNIT" =~ ^[0-9]+$ ]] && (( PREFIX_MATCH_UNIT % 64 == 0 && PREFIX_MATCH_UNIT > 0 )); } \
+  || err "PREFIX_MATCH_UNIT must be empty or a positive multiple of 64 (got '$PREFIX_MATCH_UNIT')"
+[[ "$SHUTDOWN_TIMEOUT" =~ ^[0-9]+$ ]] || err "SHUTDOWN_TIMEOUT must be an integer number of seconds (got '$SHUTDOWN_TIMEOUT')"
 [[ "$MTP_K" -le 2 ]] || err "MTP_K=$MTP_K exceeds the validated 2"
 IFS=',' read -r -a CARDS <<< "$GPUS"
 [[ "${#CARDS[@]}" -eq 4 ]] || err "GPUS must list exactly 4 card indices for TP4 (got '$GPUS')"
@@ -397,9 +403,12 @@ build_run() {
     --chat-template /opt/exl3xpu/templates/ornith-chat-template.jinja
     --reasoning-parser qwen3_effort
     --reasoning-parser-plugin /opt/exl3xpu/templates/qwen3_effort_parser.py
-    --kv-cache-dtype fp8_e4m3
     --speculative-config "{\"method\":\"mtp\",\"num_speculative_tokens\":$MTP_K}"
+    --async-scheduling
+    --shutdown-timeout "$SHUTDOWN_TIMEOUT"
   )
+  [[ "$KV_CACHE_DTYPE" == fp8 ]] && SERVE_ARGS+=(--kv-cache-dtype fp8_e4m3)
+  [[ -z "$PREFIX_MATCH_UNIT" ]] || SERVE_ARGS+=(--prefix-match-unit "$PREFIX_MATCH_UNIT")
   RUN_ARGS=(
     -d --name "$CONTAINER_NAME"
     --network host --ipc host --shm-size 17179869184
@@ -413,8 +422,8 @@ build_run() {
     -v "$vxk/vllm_xpu_kernels:/opt/venv/lib/python3.12/site-packages/vllm_xpu_kernels:ro"
     --env-file "$SCRIPT_DIR/env.list"
     -e "ZE_AFFINITY_MASK=$ZE_AFFINITY_MASK"
-    -e EXL3_VLLM_PATCHES=fp8kv
   )
+  [[ "$KV_CACHE_DTYPE" == fp8 ]] && RUN_ARGS+=(-e EXL3_VLLM_PATCHES=fp8kv)   # the fp8-KV prefill route
   # ornith.config: a hash of what decides what serves (env.list, the dist's contents, the image, the serve args).
   # It is this recipe's own config hash, not a deployment plan's.
   CONFIG_SHA=$(
