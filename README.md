@@ -138,10 +138,13 @@ replaces a container it created itself: every container it starts carries the la
 1. refuses, and leaves the container exactly as it is, when a container of that name lacks the first two labels
    (another deployment, another checkout, or one started by an older `start.sh`), or is paused or restarting;
 2. removes its own stopped container with a plain `docker rm`;
-3. for its own running container, waits until the engine's `/metrics` reports no running requests (up to
-   `STOP_DRAIN_SECONDS`, default 300), sends SIGTERM, waits up to `STOP_WAIT_SECONDS` (default 180) for the engine
-   to exit, then removes the container. If `/metrics` does not answer, requests are still running, or the engine
-   does not exit in time, it refuses and exits non-zero.
+3. for its own running container, waits until the engine's `/metrics` reports no requests running or waiting
+   (`vllm:num_requests_running` plus `vllm:num_requests_waiting`, read on the port in its `ornith.port` label, or
+   on `PORT` when that label is missing; up to `STOP_DRAIN_SECONDS`, default 300), sends SIGTERM, waits up to
+   `STOP_WAIT_SECONDS` (default 180) for the engine to exit, then removes the container. If `/metrics` does not
+   answer or lacks either gauge, requests are still running or waiting, or the engine does not exit in time, it
+   refuses and exits non-zero. Stop the clients first: a request that arrives between the last drain check and the
+   SIGTERM is not covered.
 
 It never sends SIGKILL and never runs `docker rm -f` or `docker stop`: on the `xe` driver, killing an engine with
 GPU kernels in flight has reset the GPU engine. A plain `./start.sh` refuses the same way when a container of that

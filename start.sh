@@ -18,7 +18,7 @@
 # container it creates (ornith.created-by=start.sh, ornith.checkout=<id of this checkout>, ornith.port=<port>).
 # A container named CONTAINER_NAME without both of the first two labels (another deployment, another checkout,
 # an older start.sh) makes it refuse and exit non-zero without touching anything. Its own running container is
-# stopped only after the engine reports no running requests (waiting up to STOP_DRAIN_SECONDS, default 300), with
+# stopped only after the engine reports no running or waiting requests (up to STOP_DRAIN_SECONDS, default 300), with
 # SIGTERM and a bounded wait (STOP_WAIT_SECONDS, default 180). It never sends SIGKILL and never runs docker rm -f
 # or docker stop: on the xe driver, killing an engine with GPU kernels in flight has reset the GPU engine.
 #
@@ -139,10 +139,14 @@ not_ours() {
   fi
 }
 
-# the engine's vllm:num_requests_running, summed; empty when /metrics does not answer
-requests_running() {
+# requests the engine has in flight: vllm:num_requests_running plus vllm:num_requests_waiting, summed over their
+# series (a waiting request is scheduled on the next step, so it counts as in flight). Empty when /metrics does not
+# answer or lacks either gauge, so the caller cannot mistake a missing gauge for an idle engine.
+requests_in_flight() {
   curl -fsS -m 5 "http://127.0.0.1:$1/metrics" 2>/dev/null \
-    | awk '/^vllm:num_requests_running[{ ]/ { s += $NF; n++ } END { if (n) printf "%d\n", s }'
+    | awk '/^vllm:num_requests_running[{ ]/ { s += $NF; r++ }
+           /^vllm:num_requests_waiting[{ ]/ { s += $NF; w++ }
+           END { if (r && w) printf "%d\n", s }'
 }
 
 # name_free check|apply: CONTAINER_NAME must be unused, or hold this checkout's own STOPPED container.
@@ -186,19 +190,20 @@ stop_own() {
   esac
   port=$(clabel "$name" "$LABEL_PORT" || true)
   is_posint "$port" || port=$PORT
-  # 1. drain: never signal an engine that is serving a request (a request in flight means GPU kernels in flight)
+  # 1. drain: never signal an engine with a request running or waiting (a request in flight means GPU kernels in
+  #    flight, and a waiting one is scheduled on the next step)
   deadline=$(( $(date +%s) + STOP_DRAIN ))
   while :; do
-    r=$(requests_running "$port" || true)
-    [[ -n "$r" ]] || refuse "$name does not answer /metrics on :$port, so start.sh cannot confirm that nothing is in flight; it was not signalled. Wait until it answers (or exits on its own), then run ./start.sh stop again."
+    r=$(requests_in_flight "$port" || true)
+    [[ -n "$r" ]] || refuse "$name does not answer /metrics on :$port with both vllm:num_requests_running and vllm:num_requests_waiting, so start.sh cannot confirm that nothing is in flight; it was not signalled. Wait until it answers (or exits on its own), then run ./start.sh stop again."
     [[ "$r" -eq 0 ]] && break
     [[ "$(date +%s)" -lt "$deadline" ]] \
-      || refuse "$r request(s) still running on :$port after ${STOP_DRAIN}s (STOP_DRAIN_SECONDS); $name was not signalled. Stop its clients, then run ./start.sh stop again."
-    info "$r request(s) running on :$port; waiting for them to finish (up to ${STOP_DRAIN}s)"
+      || refuse "$r request(s) still running or waiting on :$port after ${STOP_DRAIN}s (STOP_DRAIN_SECONDS); $name was not signalled. Stop its clients, then run ./start.sh stop again."
+    info "$r request(s) running or waiting on :$port; waiting for them to finish (up to ${STOP_DRAIN}s)"
     sleep 5
   done
   # 2. SIGTERM only: docker kill --signal SIGTERM never escalates (docker stop would SIGKILL after its timeout)
-  info "no requests running; sending SIGTERM to $name and waiting up to ${STOP_WAIT}s for it to exit (no SIGKILL)"
+  info "no requests running or waiting; sending SIGTERM to $name and waiting up to ${STOP_WAIT}s for it to exit (no SIGKILL)"
   log "STOP $name: SIGTERM"
   docker kill --signal SIGTERM "$name" >/dev/null || refuse "could not send SIGTERM to $name; left as is"
   deadline=$(( $(date +%s) + STOP_WAIT ))
