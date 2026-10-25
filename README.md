@@ -213,8 +213,9 @@ it on a slower host.
 
 ## Status
 
-Serving. Milestone 5 is not met: the 60-minute gate soak fails two of its rows, and one row of the live gate run
-passes only under a rule change made after an earlier failure.
+Serving. Milestone 5 is not met: the 60-minute gate soak fails two of its rows, and on the live gate run
+`nan_sweep_concurrency` passes only under a rule change made after an earlier failure that has not been ruled on
+(the 16-way row passes only against a floor the project owner lowered after a miss; see below).
 
 **Gate run on the live engine** (the serving container itself, no restart, the shipping config): every gate row
 passed under the gate code as it ran, but `nan_sweep_concurrency` passes only under the post-failure rule
@@ -233,14 +234,17 @@ a failure, so it is listed here.
 minutes): **failed two rows**.
 - Prefix-resend lookups at 21–23K tokens (a 1,300-row item/code table, ask for one item's code): 265 of 270 right.
   The 5 wrong answers were each the code of a different row of the same table (one or two rows away in three of
-  them), not garbage; one request and its exact resend gave the same wrong code.
+  them), not garbage; one request and its exact resend gave the same wrong code. That makes four distinct failed
+  lookups. Each was re-sent 3 times, one at a time, and only when the engine reported no other request running or
+  waiting. Two were wrong again 3 times of 3, one 1 time of 3, and one was right 3 times of 3, so three of the four
+  also fail without load.
 - The fill sweep under load: 2 of 6 sweeps clean. Fill 5 answered `401` once and fill 40 answered `491` twice and
-  `401` once; both answer `391` on their own. No truncation, no non-finite logprobs, no degenerate text.
+  `401` once; both answer `391` on their own (3 of 3 each, re-sent one at a time when the engine reported no other request running or waiting). No truncation, no non-finite logprobs, no degenerate text.
 - Every other row passed: the same container throughout, 180/180 load requests clean, 44/44 needles at 64K, 0
   engine or kernel resets, 0 graph captures after warmup, 0 pages swapped out.
 
-Whether these two rows fail because of fp8 KV or because of the model and engine at this load is not measured yet:
-no bf16-KV run has had this soak. This is the first run of this soak; the earlier 60-minute soak (Measured) was a
+Whether these two rows fail because of fp8 KV or because of the model and engine is not measured yet: no bf16-KV
+run has had this soak or these re-sends. This is the first run of this soak; the earlier 60-minute soak (Measured) was a
 capacity test that ran neither check.
 
 Two earlier gate rows are recorded here honestly, from two different runs. The final full gate bundle (18:21Z boot)
@@ -267,7 +271,8 @@ not have seen this case. It is open.
 
 Open:
 
-- the two failed soak rows above: wrong table lookups at ~22K tokens and fill-probe flips, both under load;
+- the two failed soak rows above: wrong table lookups at ~22K tokens (three of the four also fail without load) and
+  fill-probe flips under load;
 - the manual KV-bytes variant (1,695,325 tokens): measured and probe-checked, ships only after its own 60-minute
   soak;
 - the source fix for the capture leak behind the first-request guard;
