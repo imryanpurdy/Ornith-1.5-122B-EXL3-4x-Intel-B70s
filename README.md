@@ -73,9 +73,9 @@ so the chat template's thinking switch does not apply to them.
 
 | workload | how it was measured | tok/s |
 |---|---|---:|
-| 1 stream | 20 requests, first discarded, median of 19, 600-token cap | 113.6 |
-| 4 concurrent | 15 rounds, median of rounds 2–15, 600-token cap per stream | 302 |
-| 16 live-shaped streams | 16 distinct 10–30K-token prompts (code, logs, docs), temperature 0.6, thinking on for half, 60-second steady window | 427 |
+| 1 stream | 20 requests, first discarded, median of 19, 600-token cap | 112.3 |
+| 4 concurrent | 15 rounds, median of rounds 2–15, 600-token cap per stream | 308 |
+| 16 live-shaped streams | 16 distinct 10–30K-token prompts (code, logs, docs), temperature 0.6, thinking on for half, 60-second steady window, median of 2 runs | 437 |
 
 KV pool, and the same pool as a multiple of the 407,455 tokens the previous production engine held:
 
