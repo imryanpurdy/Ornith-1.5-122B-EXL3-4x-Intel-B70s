@@ -80,6 +80,11 @@ struct Route {
 
 // Prefetch n_rows tile-row strips (NW dwords each, row stride in dwords) into the cache hierarchy, no registers.
 // L1C: also allocate in L1 (else L2 only).
+// Double-buffered trellis tile loads in GateUp / Down (default on; -DEXL3_MOE_NO_DBUF turns it off). B70 card 0,
+// default plan, live 16-way routing: M=48 694.5 -> 653.8 us (layer 24), 798.2 -> 745.8 us (layer 0); bit-identical.
+#if !defined(EXL3_MOE_NO_DBUF) && !defined(EXL3_MOE_BATCHLOAD) && !defined(EXL3_MOE_DBUF)
+#define EXL3_MOE_DBUF 1
+#endif
 #ifndef EXL3_MOE_PF
 #define EXL3_MOE_PF 0   // REJECTED on B70: 1 (L2) M=1 82 -> 128 us, 2 (L1+L2) -> 130 us
 #endif
@@ -168,6 +173,15 @@ struct GateUpKernel {
             for (; i < tail_dw; ++i) d2[i] = src[i];
         }
 
+#ifdef EXL3_MOE_DBUF
+        // double buffer: tile-row r+1's trellis words are requested before tile-row r is decoded, so the load latency
+        // overlaps the decode (and the next k block's input Hadamard). After a chunk's last row it prefetches row r0
+        // for the next MR-row chunk; the last chunk prefetches nothing. Same words, same math. Grouped plans only
+        // (MR >= 2): pair mode (MR = 1) keeps the plain loads (card 0, ep4 M = 3: 38.7 -> 41.3 us with them).
+        constexpr bool DB = MR >= 2;
+        simd<uint32_t, NT * W> wnext;
+        if constexpr (DB) wnext = block_load<uint32_t, NT * W>(tr + ((size_t)r0 * tiles_n + tile_n0) * W);
+#endif
         for (int c0 = 0; c0 < cnt; c0 += MR) {
             int tok[MR];
 #pragma unroll
@@ -208,6 +222,18 @@ struct GateUpKernel {
                     prev.template select<NT * W - 1, 1>(1) = words.template select<NT * W - 1, 1>(0);
 #pragma unroll
                     for (int j = 0; j < NT; ++j) prev[j * W] = words[j * W + W - 1];
+#elif defined(EXL3_MOE_DBUF)
+                    size_t t0 = (size_t)(rb + i) * tiles_n + tile_n0;
+                    if constexpr (DB) {
+                        words = wnext;
+                        int rn = rb + i + 1;
+                        if (rn == r0 + rps) rn = c0 + MR < cnt ? r0 : -1;
+                        if (rn >= 0) wnext = block_load<uint32_t, NT * W>(tr + ((size_t)rn * tiles_n + tile_n0) * W);
+                        planar_prev<K, NT>(words, prev);
+                    } else {
+                        load_planar<K, NT>(tr + t0 * W, words, prev);
+                    }
+                    if (dst && c0 == 0) block_store<uint32_t, NT * W>(dst + t0 * W, words);
 #else
                     size_t t0 = (size_t)(rb + i) * tiles_n + tile_n0;
                     load_planar<K, NT>(tr + t0 * W, words, prev);
@@ -305,6 +331,11 @@ struct DownKernel {
         uint32_t* dst = rt.fill ? reinterpret_cast<uint32_t*>(rt.fill[e]) : nullptr;
         if (dst) dst += off_d / 4;
 
+#ifdef EXL3_MOE_DBUF
+        constexpr bool DB = MR >= 2;    // as GateUpKernel
+        simd<uint32_t, NT * W> wnext;
+        if constexpr (DB) wnext = block_load<uint32_t, NT * W>(tr + ((size_t)r0 * tiles_n + tile_n0) * W);
+#endif
         for (int c0 = 0; c0 < cnt; c0 += MR) {
             bool valid[MR];
 #pragma unroll
@@ -326,6 +357,17 @@ struct DownKernel {
                 prev.template select<NT * W - 1, 1>(1) = words.template select<NT * W - 1, 1>(0);
 #pragma unroll
                 for (int j = 0; j < NT; ++j) prev[j * W] = words[j * W + W - 1];
+#elif defined(EXL3_MOE_DBUF)
+                if constexpr (DB) {
+                    words = wnext;
+                    int rn = r + 1;
+                    if (rn == r0 + rps) rn = c0 + MR < cnt ? r0 : -1;
+                    if (rn >= 0) wnext = block_load<uint32_t, NT * W>(tr + ((size_t)rn * tiles_n + tile_n0) * W);
+                    planar_prev<K, NT>(words, prev);
+                } else {
+                    load_planar<K, NT>(tr + ((size_t)r * tiles_n + tile_n0) * W, words, prev);
+                }
+                if (dst && c0 == 0) block_store<uint32_t, NT * W>(dst + ((size_t)r * tiles_n + tile_n0) * W, words);
 #else
                 load_planar<K, NT>(tr + ((size_t)r * tiles_n + tile_n0) * W, words, prev);
                 if (dst && c0 == 0) block_store<uint32_t, NT * W>(dst + ((size_t)r * tiles_n + tile_n0) * W, words);
